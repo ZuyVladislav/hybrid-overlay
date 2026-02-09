@@ -14,6 +14,7 @@ USERS: Dict[str, dict] = {
 # Сетевые параметры
 UDP_TIMEOUT_S = 2.0
 RETRIES = 3
+PRECONNECT_ENABLED = False
 
 # Полезная нагрузка
 I3_LEN = 24
