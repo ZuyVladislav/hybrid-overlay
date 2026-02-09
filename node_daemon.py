@@ -444,6 +444,8 @@ class NodeDaemon:
                 has_session = x2 in self.sessions
             if not has_session:
                 self.logger.warning(f"[I1] no session to X2={x2}, trying next")
+            if not self.ensure_session(x2):
+                self.logger.warning(f"[I1] cannot establish session to X2={x2}, trying next")
                 continue
 
             # I2: X1->X2
