@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-node_daemon.py (fixed build)
+node_daemon.py (stable build)
 
-Key properties:
-- Single UDP receiver thread -> no recvfrom() race.
-- Hop-to-hop mgmt session: 4-step exchange, X25519 + HKDF-SHA256 + AESGCM.
-- A chooses X1 randomly (exclude only A). X1 chooses X2 randomly (exclude only X1).
-- X2==B is detected on X2 at I2 stage -> reject + plaintext ERROR back to A via X1.
-- OK(X2) format fixed: header is ASCII kv + "|OK=" + raw bytes (no broken split).
-- No sleep polling for OKX2 / HS responses: mailbox events.
+Fixes vs your current:
+1) Handshake mailbox is now keyed by sid AND guarded by hs_expect[sid]=peer:
+   - prevents "bad INIT_RESP mailbox" due to interleaving / stray responses.
+2) preconnect_thread is initialized properly.
+3) More defensive handling when peer_from_src() cannot map sender.
+4) Cleanup removes hs_expect entries too.
 
 Requires: config.py, crypto_util.py, logging_util.py, protocol.py
 """
@@ -91,23 +90,31 @@ class NodeDaemon:
         self.lock = threading.Lock()
         self.running = True
 
+        # ---- preconnect thread handle (FIX) ----
+        self.preconnect_thread: Optional[threading.Thread] = None
+
         # sessions / pending responder state
         self.sessions: Dict[str, MgmtSession] = {}
         self.pending: Dict[str, PendingHS] = {}
 
-        # ---- Mailboxes (only receiver thread reads socket) ----
+        # ---- Handshake mailboxes (initiator side) ----
         self.hs_initresp: Dict[str, dict] = {}
         self.hs_authresp: Dict[str, dict] = {}
         self.hs_init_ev: Dict[str, threading.Event] = {}
         self.hs_auth_ev: Dict[str, threading.Event] = {}
 
-        # OKX2 mailbox by conn_id
+        # Guard: for each sid we store expected peer (prevents mailbox mixup)
+        self.hs_expect: Dict[str, str] = {}
+
+        # OKX2 mailbox by conn_id (initiator side)
         self.okx2_ev: Dict[str, threading.Event] = {}
         self.okx2_data: Dict[str, bytes] = {}
         self.okx2_x2name: Dict[str, str] = {}
 
         # active connections (initiator only)
         self.conns: Dict[str, ConnState] = {}
+
+        # per-peer inflight ensure_session gate
         self.ensure_inflight: Dict[str, threading.Event] = {}
 
     # ---------- address book ----------
@@ -148,7 +155,7 @@ class NodeDaemon:
             return None
 
     # =========================
-    # Link crypto
+    # Link crypto (secure hop-to-hop)
     # =========================
 
     def link_send(self, peer: str, mtype: str, payload: bytes, meta: dict = None):
@@ -160,19 +167,28 @@ class NodeDaemon:
         aad = f"{mtype}:{self.name}->{peer}:{sess.sid}".encode()
         nonce, ct = aesgcm_encrypt(sess.key, payload, aad=aad)
 
-        msg = {"t": mtype, "sid": sess.sid, "from": self.name, "to": peer,
-               "nonce": nonce.hex(), "ct": ct.hex(), "meta": meta or {}}
+        msg = {
+            "t": mtype, "sid": sess.sid,
+            "from": self.name, "to": peer,
+            "nonce": nonce.hex(), "ct": ct.hex(),
+            "meta": meta or {}
+        }
         self.send_peer(peer, jdump(msg))
 
     def link_decrypt(self, msg: dict) -> bytes:
-        peer = msg["from"]
+        peer = msg.get("from", "")
         with self.lock:
             sess = self.sessions.get(peer)
         if not sess:
             raise RuntimeError(f"No session from {peer}")
 
         aad = f"{msg['t']}:{peer}->{self.name}:{sess.sid}".encode()
-        return aesgcm_decrypt(sess.key, bytes.fromhex(msg["nonce"]), bytes.fromhex(msg["ct"]), aad=aad)
+        return aesgcm_decrypt(
+            sess.key,
+            bytes.fromhex(msg["nonce"]),
+            bytes.fromhex(msg["ct"]),
+            aad=aad
+        )
 
     # =========================
     # One and only packet dispatcher
@@ -186,11 +202,12 @@ class NodeDaemon:
 
         t = p.get("t")
 
+        # local connect (plaintext, localhost only)
         if t == T_LOCAL_CONNECT:
             self.on_local_connect(p, src)
             return
 
-        # mgmt responder
+        # mgmt responder requires known peer mapping
         if t == T_MGMT_INIT:
             self.on_mgmt_init(p, peer)
             return
@@ -198,11 +215,16 @@ class NodeDaemon:
             self.on_mgmt_auth(p, peer)
             return
 
-        # mgmt initiator mailbox
+        # mgmt initiator mailboxes (FIX: drop mismatched peer for this sid)
         if t == T_MGMT_INIT_RESP:
             sid = p.get("sid")
             if sid:
                 with self.lock:
+                    exp = self.hs_expect.get(sid)
+                    # If we know expected peer, drop responses from others.
+                    if exp is not None and p.get("from") != exp:
+                        # stray/late response for sid -> ignore
+                        return
                     self.hs_initresp[sid] = p
                     ev = self.hs_init_ev.get(sid)
                 if ev:
@@ -213,23 +235,29 @@ class NodeDaemon:
             sid = p.get("sid")
             if sid:
                 with self.lock:
+                    exp = self.hs_expect.get(sid)
+                    if exp is not None and p.get("from") != exp:
+                        return
                     self.hs_authresp[sid] = p
                     ev = self.hs_auth_ev.get(sid)
                 if ev:
                     ev.set()
             return
 
-        # errors are plaintext
+        # errors are plaintext (may come from unknown src if peer mapping fails)
         if t == T_ERROR:
             self.on_error(p, peer)
             return
 
-        # secure messages
+        # secure messages require known peer mapping (session lookup uses p["from"])
         if t in (T_I1, T_I2, T_OKX2, T_PROXY_BLOB):
+            if not peer:
+                self.logger.warning(f"[DROP] secure msg t={t} from unknown src={src}")
+                return
             self.on_secure_msg(p, peer)
             return
 
-        self.logger.info(f"[DROP] unknown t={t} from={peer}")
+        self.logger.info(f"[DROP] unknown t={t} from={peer} src={src}")
 
     # =========================
     # MGMT responder
@@ -237,7 +265,9 @@ class NodeDaemon:
 
     def on_mgmt_init(self, p: dict, peer: Optional[str]):
         if not peer:
+            self.logger.warning("[MGMT] INIT from unknown peer (src not in USERS)")
             return
+
         sid = p["sid"]
         i_pub = bytes.fromhex(p["ke"])
         ni = bytes.fromhex(p["ni"])
@@ -251,7 +281,8 @@ class NodeDaemon:
             self.pending[sid] = PendingHS(priv=r_priv, nr=nr, ni=ni, i_pub=i_pub, label=label)
 
         resp = jdump({
-            "t": T_MGMT_INIT_RESP, "sid": sid, "from": self.name, "to": peer,
+            "t": T_MGMT_INIT_RESP, "sid": sid,
+            "from": self.name, "to": peer,
             "nr": nr.hex(), "ke": r_pub.hex()
         })
         self.send_peer(peer, resp)
@@ -259,7 +290,9 @@ class NodeDaemon:
 
     def on_mgmt_auth(self, p: dict, peer: Optional[str]):
         if not peer:
+            self.logger.warning("[MGMT] AUTH from unknown peer (src not in USERS)")
             return
+
         sid = p["sid"]
 
         with self.lock:
@@ -283,8 +316,11 @@ class NodeDaemon:
         auth_plain = b"ID=" + self.name.encode() + b"|AUTH=" + secrets.token_bytes(16)
         n2, c2 = aesgcm_encrypt(kd, auth_plain, aad=aad2)
 
-        resp = jdump({"t": T_MGMT_AUTH_RESP, "sid": sid, "from": self.name, "to": peer,
-                      "nonce": n2.hex(), "ct": c2.hex()})
+        resp = jdump({
+            "t": T_MGMT_AUTH_RESP, "sid": sid,
+            "from": self.name, "to": peer,
+            "nonce": n2.hex(), "ct": c2.hex()
+        })
         self.send_peer(peer, resp)
 
         with self.lock:
@@ -298,6 +334,7 @@ class NodeDaemon:
     # =========================
 
     def ensure_session(self, peer: str, reason: str = "") -> bool:
+        # fast-path / inflight gate
         with self.lock:
             if peer in self.sessions:
                 return True
@@ -308,6 +345,7 @@ class NodeDaemon:
                 wait_ev = threading.Event()
                 self.ensure_inflight[peer] = wait_ev
 
+        # if another thread is already establishing, wait and return result
         if inflight:
             wait_ev.wait(UDP_TIMEOUT_S * RETRIES)
             with self.lock:
@@ -317,9 +355,10 @@ class NodeDaemon:
 
         for attempt in range(RETRIES):
             if attempt == 0:
-                reason_str = reason or "unspecified"
-                self.logger.info(f"[MGMT] ensure_session start {self.name}->{peer} reason={reason_str}")
+                self.logger.info(f"[MGMT] ensure_session start {self.name}->{peer} reason={reason or 'unspecified'}")
+
             sid = secrets.token_hex(8)
+
             init_ev = threading.Event()
             auth_ev = threading.Event()
             with self.lock:
@@ -327,13 +366,15 @@ class NodeDaemon:
                 self.hs_auth_ev[sid] = auth_ev
                 self.hs_initresp.pop(sid, None)
                 self.hs_authresp.pop(sid, None)
+                self.hs_expect[sid] = peer  # FIX: expected sender for this sid
 
             i_priv = x25519.X25519PrivateKey.generate()
             i_pub = xpub_bytes(i_priv.public_key())
             ni = secrets.token_bytes(16)
 
             init_msg = jdump({
-                "t": T_MGMT_INIT, "sid": sid, "from": self.name, "to": peer,
+                "t": T_MGMT_INIT, "sid": sid,
+                "from": self.name, "to": peer,
                 "ni": ni.hex(), "ke": i_pub.hex()
             })
             self.send_peer(peer, init_msg)
@@ -347,8 +388,13 @@ class NodeDaemon:
             with self.lock:
                 resp = self.hs_initresp.get(sid)
 
+            # now mailbox cannot be polluted by other peers (hs_expect guard),
+            # but still keep strict check for robustness:
             if not resp or resp.get("from") != peer or resp.get("to") != self.name:
-                self.logger.warning(f"[MGMT] bad INIT_RESP mailbox sid={sid} reason={reason or 'unspecified'}")
+                self.logger.warning(
+                    f"[MGMT] bad INIT_RESP mailbox sid={sid} "
+                    f"exp_from={peer} exp_to={self.name} got_from={(resp or {}).get('from')} got_to={(resp or {}).get('to')}"
+                )
                 self._cleanup_hs(sid)
                 continue
 
@@ -360,8 +406,12 @@ class NodeDaemon:
             aad = f"AUTH:{label}:{self.name}->{peer}:{sid}".encode()
             auth_plain = b"ID=" + self.name.encode() + b"|AUTH=" + secrets.token_bytes(16)
             n1, c1 = aesgcm_encrypt(kd, auth_plain, aad=aad)
-            auth_msg = jdump({"t": T_MGMT_AUTH, "sid": sid, "from": self.name, "to": peer,
-                              "nonce": n1.hex(), "ct": c1.hex()})
+
+            auth_msg = jdump({
+                "t": T_MGMT_AUTH, "sid": sid,
+                "from": self.name, "to": peer,
+                "nonce": n1.hex(), "ct": c1.hex()
+            })
             self.send_peer(peer, auth_msg)
 
             if not auth_ev.wait(UDP_TIMEOUT_S):
@@ -373,7 +423,10 @@ class NodeDaemon:
                 resp2 = self.hs_authresp.get(sid)
 
             if not resp2 or resp2.get("from") != peer or resp2.get("to") != self.name:
-                self.logger.warning(f"[MGMT] bad AUTH_RESP mailbox sid={sid} reason={reason or 'unspecified'}")
+                self.logger.warning(
+                    f"[MGMT] bad AUTH_RESP mailbox sid={sid} "
+                    f"exp_from={peer} exp_to={self.name} got_from={(resp2 or {}).get('from')} got_to={(resp2 or {}).get('to')}"
+                )
                 self._cleanup_hs(sid)
                 continue
 
@@ -381,7 +434,7 @@ class NodeDaemon:
             try:
                 _ = aesgcm_decrypt(kd, bytes.fromhex(resp2["nonce"]), bytes.fromhex(resp2["ct"]), aad=aad2)
             except Exception as e:
-                self.logger.error(f"[MGMT] AUTH_RESP decrypt fail: {e}")
+                self.logger.error(f"[MGMT] AUTH_RESP decrypt fail sid={sid}: {e}")
                 self._cleanup_hs(sid)
                 continue
 
@@ -390,11 +443,13 @@ class NodeDaemon:
 
             self._cleanup_hs(sid)
             self.logger.info(f"[MGMT] EST {self.name}<->{peer} sid={sid} reason={reason or 'unspecified'}")
+
             with self.lock:
                 self.ensure_inflight.pop(peer, None)
                 wait_ev.set()
             return True
 
+        # failed
         with self.lock:
             self.ensure_inflight.pop(peer, None)
             wait_ev.set()
@@ -406,14 +461,13 @@ class NodeDaemon:
             self.hs_auth_ev.pop(sid, None)
             self.hs_initresp.pop(sid, None)
             self.hs_authresp.pop(sid, None)
+            self.hs_expect.pop(sid, None)  # FIX
 
     # =========================
     # Secure messages
     # =========================
 
-    def on_secure_msg(self, p: dict, peer: Optional[str]):
-        if not peer:
-            return
+    def on_secure_msg(self, p: dict, peer: str):
         t = p["t"]
         try:
             plain = self.link_decrypt(p)
@@ -466,7 +520,6 @@ class NodeDaemon:
             daemon=True,
         )
         th.start()
-        return
 
     # I2: X1->X2
     def handle_I2(self, peer: str, plain: bytes):
@@ -484,24 +537,23 @@ class NodeDaemon:
 
         self.logger.info(f"[ROLE] X2={self.name} for REQ={req} DST={dst} CONN={conn_id}")
 
-        # ✅ Reject case: I'm X2 and I'm also destination (X2 == B)
+        # Reject: X2 == destination
         if self.name == dst:
             self.logger.warning(f"[I2] REJECT: X2==DST ({self.name}) CONN={conn_id} REQ={req}")
-            # plaintext ERROR back to A via X1 (=peer)
-            self.send_error_back(conn_id, req, peer, phase="OKX2", code="DEST_IS_X2", msg="X2 became destination; drop+retry")
+            self.send_error_back(conn_id, req, peer, phase="OKX2", code="DEST_IS_X2",
+                                 msg="X2 became destination; drop+retry")
             return
 
-        # OK(X2): demo: 32+16
         ok = secrets.token_bytes(32) + secrets.token_bytes(16)
 
-        # ✅ FIXED FORMAT: ASCII header + b"|OK=" + raw ok bytes
+        # header + "|OK=" + raw bytes
         header = f"CONN={conn_id}|REQ={req}|DST={dst}|X2={x2}".encode()
         payload = header + b"|OK=" + ok
 
         self.link_send(peer, T_OKX2, payload)
         self.logger.info(f"[OKX2] -> {peer} CONN={conn_id} for REQ={req} ok_len={len(ok)}")
 
-    # OKX2: X2->X1 (KD2) then X1->A (KD1)
+    # OKX2: X2->X1 then X1->A
     def handle_OKX2(self, peer: str, plain: bytes):
         marker = b"|OK="
         if marker not in plain:
@@ -529,7 +581,7 @@ class NodeDaemon:
             self.logger.info(f"[OKX2] fwd {self.name}->{req} CONN={conn_id}")
             return
 
-        # I'm requester(A)
+        # I'm requester (A)
         with self.lock:
             ev = self.okx2_ev.get(conn_id)
             self.okx2_data[conn_id] = ok
@@ -538,7 +590,7 @@ class NodeDaemon:
             ev.set()
         self.logger.info(f"[ROLE] A={self.name} got OKX2 from X2={x2} via {peer} CONN={conn_id}")
 
-    # PROXY_BLOB forward path: src->x1->x2->dst; back path: dst->x2->x1->src
+    # PROXY_BLOB forward path: src->x1->x2->dst; back: dst->x2->x1->src
     def handle_PROXY(self, peer: str, plain: bytes, meta: dict):
         conn_id = meta.get("conn_id", "")
         src_u = meta.get("src", "")
@@ -557,7 +609,7 @@ class NodeDaemon:
             self.logger.warning(f"[PROXY] route mismatch idx={idx} dir={direction} route={route}")
             return
 
-        # reached destination on forward direction
+        # arrived at destination (forward)
         if direction == "fwd" and self.name == dst_u and idx == 3:
             self.logger.info(f"[PROXY] ARRIVE DST={self.name} phase={phase} len={len(plain)} CONN={conn_id}")
             resp = plain
@@ -655,6 +707,7 @@ class NodeDaemon:
         ike_init_len = int(p.get("ike_init_len", 499))
         ike_auth_len = int(p.get("ike_auth_len", 499))
         retries = int(p.get("retries", 5))
+
         self.logger.info(
             f"[LOCAL] connect request from={src[0]} user={user} dst={dst} "
             f"ike_init_len={ike_init_len} ike_auth_len={ike_auth_len} retries={retries}"
@@ -722,9 +775,7 @@ class NodeDaemon:
                 if st.okx2_event.wait(0.1):
                     break
                 if st.done_event.is_set():
-                    self.logger.warning(
-                        f"[CONN {st.conn_id}] FAIL {st.last_error}, retry_left={st.retries_left}"
-                    )
+                    self.logger.warning(f"[CONN {st.conn_id}] FAIL {st.last_error}, retry_left={st.retries_left}")
                     st.retries_left -= 1
                     st.x1 = self._pick_new_x1(st.src)
                     break
@@ -767,7 +818,6 @@ class NodeDaemon:
                 st.x1 = self._pick_new_x1(st.src)
                 continue
 
-            # if an ERROR arrives, done_event is set
             if st.done_event.wait(UDP_TIMEOUT_S * 8):
                 self.logger.warning(f"[CONN {st.conn_id}] FAIL {st.last_error}, retry_left={st.retries_left}")
                 st.retries_left -= 1
@@ -792,9 +842,11 @@ class NodeDaemon:
 
     def serve_forever(self):
         self.logger.info(f"Daemon started as {self.name} on UDP/{USERS[self.name]['port']}")
-        if PRECONNECT_ENABLED and not self.preconnect_thread:
+
+        if PRECONNECT_ENABLED and self.preconnect_thread is None:
             self.preconnect_thread = threading.Thread(target=self._preconnect_loop, daemon=True)
             self.preconnect_thread.start()
+
         while self.running:
             got = self.recv_one()
             if not got:
@@ -826,20 +878,18 @@ class NodeDaemon:
             conn_id, req, self.name,
             phase="OKX2", code="NO_SESSION_X2", msg="cannot ensure any X2"
         )
-        return
+
     def _preconnect_loop(self):
         time.sleep(random.uniform(0.2, 0.8))
         while self.running:
             peers = [u for u in USERS.keys() if u != self.name]
             random.shuffle(peers)
             for peer in peers:
-                if peer == self.name:
-                    continue
                 with self.lock:
                     has_session = peer in self.sessions or peer in self.ensure_inflight
                 if has_session:
                     continue
-                self.ensure_session(peer)
+                self.ensure_session(peer, reason="preconnect")
                 time.sleep(0.05)
             time.sleep(0.5)
 
