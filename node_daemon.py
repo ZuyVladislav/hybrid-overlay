@@ -24,7 +24,7 @@ from typing import Dict, Optional, Tuple
 
 from cryptography.hazmat.primitives.asymmetric import x25519
 
-from config import USERS, UDP_TIMEOUT_S, RETRIES, I3_LEN
+from config import USERS, UDP_TIMEOUT_S, RETRIES, I3_LEN, PRECONNECT_ENABLED
 from logging_util import setup_logger
 from crypto_util import (
     aesgcm_encrypt, aesgcm_decrypt,
@@ -791,9 +791,9 @@ class NodeDaemon:
     # Loop
     # =========================
 
-    def serve_forever(self):
+    def serve_forever(self, preconnect_enabled: bool):
         self.logger.info(f"Daemon started as {self.name} on UDP/{USERS[self.name]['port']}")
-        if not self.preconnect_thread:
+        if preconnect_enabled and not self.preconnect_thread:
             self.preconnect_thread = threading.Thread(target=self._preconnect_loop, daemon=True)
             self.preconnect_thread.start()
         while self.running:
@@ -828,6 +828,7 @@ class NodeDaemon:
             phase="OKX2", code="NO_SESSION_X2", msg="cannot ensure any X2"
         )
         return
+
     def _preconnect_loop(self):
         time.sleep(random.uniform(0.2, 0.8))
         while self.running:
@@ -840,29 +841,38 @@ class NodeDaemon:
                     has_session = peer in self.sessions or peer in self.ensure_inflight
                 if has_session:
                     continue
-                self.ensure_session(peer)
+                self.ensure_session(peer, reason="preconnect")
                 time.sleep(0.05)
             time.sleep(0.5)
-        while self.running:
-            for peer in USERS.keys():
-                if peer == self.name:
-                    continue
-                with self.lock:
-                    has_session = peer in self.sessions
-                if has_session:
-                    continue
-                self.ensure_session(peer)
-            time.sleep(1.0)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", required=True, choices=list(USERS.keys()))
+    ap.add_argument(
+        "--preconnect",
+        action="store_true",
+        help="Enable background preconnect handshakes (overrides config default).",
+    )
+    ap.add_argument(
+        "--no-preconnect",
+        action="store_true",
+        help="Disable background preconnect handshakes (overrides config default).",
+    )
     args = ap.parse_args()
 
     d = NodeDaemon(args.name)
     try:
-        d.serve_forever()
+        if args.preconnect and args.no_preconnect:
+            raise SystemExit("Choose only one: --preconnect or --no-preconnect")
+        preconnect_enabled = PRECONNECT_ENABLED
+        if args.preconnect:
+            preconnect_enabled = True
+        if args.no_preconnect:
+            preconnect_enabled = False
+        if not preconnect_enabled:
+            d.logger.info("[PRECONNECT] disabled (no background sessions)")
+        d.serve_forever(preconnect_enabled)
     except KeyboardInterrupt:
         d.stop()
 
