@@ -109,6 +109,7 @@ class NodeDaemon:
         # active connections (initiator only)
         self.conns: Dict[str, ConnState] = {}
         self.preconnect_thread: Optional[threading.Thread] = None
+        self.ensure_inflight: Dict[str, threading.Event] = {}
 
     # ---------- address book ----------
     def peer_addr(self, peer: str) -> Tuple[str, int]:
@@ -301,6 +302,17 @@ class NodeDaemon:
         with self.lock:
             if peer in self.sessions:
                 return True
+            inflight = self.ensure_inflight.get(peer)
+            if inflight:
+                wait_ev = inflight
+            else:
+                wait_ev = threading.Event()
+                self.ensure_inflight[peer] = wait_ev
+
+        if inflight:
+            wait_ev.wait(UDP_TIMEOUT_S * RETRIES)
+            with self.lock:
+                return peer in self.sessions
 
         label = f"{self.name}-{peer}"  # initiator-responder
 
@@ -376,8 +388,14 @@ class NodeDaemon:
 
             self._cleanup_hs(sid)
             self.logger.info(f"[MGMT] EST {self.name}<->{peer} sid={sid}")
+            with self.lock:
+                self.ensure_inflight.pop(peer, None)
+                wait_ev.set()
             return True
 
+        with self.lock:
+            self.ensure_inflight.pop(peer, None)
+            wait_ev.set()
         return False
 
     def _cleanup_hs(self, sid: str):
@@ -792,6 +810,20 @@ class NodeDaemon:
             pass
 
     def _preconnect_loop(self):
+        time.sleep(random.uniform(0.2, 0.8))
+        while self.running:
+            peers = [u for u in USERS.keys() if u != self.name]
+            random.shuffle(peers)
+            for peer in peers:
+                if peer == self.name:
+                    continue
+                with self.lock:
+                    has_session = peer in self.sessions or peer in self.ensure_inflight
+                if has_session:
+                    continue
+                self.ensure_session(peer)
+                time.sleep(0.05)
+            time.sleep(0.5)
         while self.running:
             for peer in USERS.keys():
                 if peer == self.name:
