@@ -18,6 +18,7 @@ import secrets
 import socket
 import threading
 import random
+import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -433,19 +434,27 @@ class NodeDaemon:
             self.logger.error("[I1] unknown REQ/DST")
             return
 
-        # X1 chooses X2 randomly excluding only itself
+        # X1 chooses X2 randomly excluding only itself; retry across candidates
         cand_x2 = [u for u in USERS.keys() if u != self.name]
-        x2 = random.choice(cand_x2)
+        random.shuffle(cand_x2)
 
-        if not self.ensure_session(x2):
-            self.logger.error(f"[I1] cannot establish session to X2={x2}")
-            self.send_error_back(conn_id, req, self.name, phase="OKX2", code="NO_SESSION_X2", msg=f"cannot ensure {x2}")
+        for x2 in cand_x2:
+            if not self.ensure_session(x2):
+                self.logger.warning(f"[I1] cannot establish session to X2={x2}, trying next")
+                continue
+
+            # I2: X1->X2
+            i2 = f"CONN={conn_id}|REQ={req}|DST={dst}|X2={x2}".encode().ljust(128, b"\x00")
+            self.link_send(x2, T_I2, i2)
+            self.logger.info(f"[I1] choose X2={x2}; -> I2 to {x2} for REQ={req}, DST={dst}")
             return
 
-        # I2: X1->X2
-        i2 = f"CONN={conn_id}|REQ={req}|DST={dst}|X2={x2}".encode().ljust(128, b"\x00")
-        self.link_send(x2, T_I2, i2)
-        self.logger.info(f"[I1] choose X2={x2}; -> I2 to {x2} for REQ={req}, DST={dst}")
+        self.logger.error("[I1] cannot establish session to any X2 candidate")
+        self.send_error_back(
+            conn_id, req, self.name,
+            phase="OKX2", code="NO_SESSION_X2", msg="cannot ensure any X2"
+        )
+        return
 
     # I2: X1->X2
     def handle_I2(self, peer: str, plain: bytes):
@@ -682,7 +691,23 @@ class NodeDaemon:
             self.link_send(st.x1, T_I1, i1)
             self.logger.info(f"[CONN {st.conn_id}] I1 sent to X1={st.x1} (X1 picks X2)")
 
-            if not st.okx2_event.wait(UDP_TIMEOUT_S * 6):
+            okx2_timeout = UDP_TIMEOUT_S * 6
+            deadline = time.monotonic() + okx2_timeout
+            while time.monotonic() < deadline:
+                if st.okx2_event.wait(0.1):
+                    break
+                if st.done_event.is_set():
+                    self.logger.warning(
+                        f"[CONN {st.conn_id}] FAIL {st.last_error}, retry_left={st.retries_left}"
+                    )
+                    st.retries_left -= 1
+                    st.x1 = self._pick_new_x1(st.src)
+                    break
+
+            if st.done_event.is_set():
+                continue
+
+            if not st.okx2_event.is_set():
                 self.logger.error(f"[CONN {st.conn_id}] timeout waiting OKX2")
                 st.retries_left -= 1
                 st.x1 = self._pick_new_x1(st.src)
