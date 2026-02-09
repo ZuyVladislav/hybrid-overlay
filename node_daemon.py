@@ -108,7 +108,6 @@ class NodeDaemon:
 
         # active connections (initiator only)
         self.conns: Dict[str, ConnState] = {}
-        self.preconnect_thread: Optional[threading.Thread] = None
         self.ensure_inflight: Dict[str, threading.Event] = {}
 
     # ---------- address book ----------
