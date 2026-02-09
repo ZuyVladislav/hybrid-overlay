@@ -843,16 +843,6 @@ class NodeDaemon:
                 self.ensure_session(peer)
                 time.sleep(0.05)
             time.sleep(0.5)
-        while self.running:
-            for peer in USERS.keys():
-                if peer == self.name:
-                    continue
-                with self.lock:
-                    has_session = peer in self.sessions
-                if has_session:
-                    continue
-                self.ensure_session(peer)
-            time.sleep(1.0)
 
 
 def main():
