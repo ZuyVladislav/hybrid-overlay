@@ -434,19 +434,27 @@ class NodeDaemon:
             self.logger.error("[I1] unknown REQ/DST")
             return
 
-        # X1 chooses X2 randomly excluding only itself
+        # X1 chooses X2 randomly excluding only itself; retry across candidates
         cand_x2 = [u for u in USERS.keys() if u != self.name]
-        x2 = random.choice(cand_x2)
+        random.shuffle(cand_x2)
 
-        if not self.ensure_session(x2):
-            self.logger.error(f"[I1] cannot establish session to X2={x2}")
-            self.send_error_back(conn_id, req, self.name, phase="OKX2", code="NO_SESSION_X2", msg=f"cannot ensure {x2}")
+        for x2 in cand_x2:
+            if not self.ensure_session(x2):
+                self.logger.warning(f"[I1] cannot establish session to X2={x2}, trying next")
+                continue
+
+            # I2: X1->X2
+            i2 = f"CONN={conn_id}|REQ={req}|DST={dst}|X2={x2}".encode().ljust(128, b"\x00")
+            self.link_send(x2, T_I2, i2)
+            self.logger.info(f"[I1] choose X2={x2}; -> I2 to {x2} for REQ={req}, DST={dst}")
             return
 
-        # I2: X1->X2
-        i2 = f"CONN={conn_id}|REQ={req}|DST={dst}|X2={x2}".encode().ljust(128, b"\x00")
-        self.link_send(x2, T_I2, i2)
-        self.logger.info(f"[I1] choose X2={x2}; -> I2 to {x2} for REQ={req}, DST={dst}")
+        self.logger.error("[I1] cannot establish session to any X2 candidate")
+        self.send_error_back(
+            conn_id, req, self.name,
+            phase="OKX2", code="NO_SESSION_X2", msg="cannot ensure any X2"
+        )
+        return
 
     # I2: X1->X2
     def handle_I2(self, peer: str, plain: bytes):
