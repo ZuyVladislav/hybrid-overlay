@@ -108,6 +108,7 @@ class NodeDaemon:
 
         # active connections (initiator only)
         self.conns: Dict[str, ConnState] = {}
+        self.preconnect_thread: Optional[threading.Thread] = None
         self.ensure_inflight: Dict[str, threading.Event] = {}
 
     # ---------- address book ----------
@@ -340,9 +341,7 @@ class NodeDaemon:
             self.logger.info(f"[MGMT] -> {peer} INIT sid={sid} attempt={attempt+1}")
 
             if not init_ev.wait(UDP_TIMEOUT_S):
-                self.logger.warning(
-                    f"[MGMT] timeout INIT_RESP from {peer} sid={sid} reason={reason or 'unspecified'}"
-                )
+                self.logger.warning(f"[MGMT] timeout INIT_RESP from {peer} sid={sid} reason={reason or 'unspecified'}")
                 self._cleanup_hs(sid)
                 continue
 
@@ -367,9 +366,7 @@ class NodeDaemon:
             self.send_peer(peer, auth_msg)
 
             if not auth_ev.wait(UDP_TIMEOUT_S):
-                self.logger.warning(
-                    f"[MGMT] timeout AUTH_RESP from {peer} sid={sid} reason={reason or 'unspecified'}"
-                )
+                self.logger.warning(f"[MGMT] timeout AUTH_RESP from {peer} sid={sid} reason={reason or 'unspecified'}")
                 self._cleanup_hs(sid)
                 continue
 
@@ -796,6 +793,9 @@ class NodeDaemon:
 
     def serve_forever(self):
         self.logger.info(f"Daemon started as {self.name} on UDP/{USERS[self.name]['port']}")
+        if not self.preconnect_thread:
+            self.preconnect_thread = threading.Thread(target=self._preconnect_loop, daemon=True)
+            self.preconnect_thread.start()
         while self.running:
             got = self.recv_one()
             if not got:
@@ -828,6 +828,31 @@ class NodeDaemon:
             phase="OKX2", code="NO_SESSION_X2", msg="cannot ensure any X2"
         )
         return
+    def _preconnect_loop(self):
+        time.sleep(random.uniform(0.2, 0.8))
+        while self.running:
+            peers = [u for u in USERS.keys() if u != self.name]
+            random.shuffle(peers)
+            for peer in peers:
+                if peer == self.name:
+                    continue
+                with self.lock:
+                    has_session = peer in self.sessions or peer in self.ensure_inflight
+                if has_session:
+                    continue
+                self.ensure_session(peer)
+                time.sleep(0.05)
+            time.sleep(0.5)
+        while self.running:
+            for peer in USERS.keys():
+                if peer == self.name:
+                    continue
+                with self.lock:
+                    has_session = peer in self.sessions
+                if has_session:
+                    continue
+                self.ensure_session(peer)
+            time.sleep(1.0)
 
 
 def main():
