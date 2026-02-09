@@ -24,7 +24,7 @@ from typing import Dict, Optional, Tuple
 
 from cryptography.hazmat.primitives.asymmetric import x25519
 
-from config import USERS, UDP_TIMEOUT_S, RETRIES, I3_LEN
+from config import USERS, UDP_TIMEOUT_S, RETRIES, I3_LEN, PRECONNECT_ENABLED
 from logging_util import setup_logger
 from crypto_util import (
     aesgcm_encrypt, aesgcm_decrypt,
@@ -793,7 +793,7 @@ class NodeDaemon:
 
     def serve_forever(self):
         self.logger.info(f"Daemon started as {self.name} on UDP/{USERS[self.name]['port']}")
-        if not self.preconnect_thread:
+        if PRECONNECT_ENABLED and not self.preconnect_thread:
             self.preconnect_thread = threading.Thread(target=self._preconnect_loop, daemon=True)
             self.preconnect_thread.start()
         while self.running:
@@ -843,16 +843,6 @@ class NodeDaemon:
                 self.ensure_session(peer)
                 time.sleep(0.05)
             time.sleep(0.5)
-        while self.running:
-            for peer in USERS.keys():
-                if peer == self.name:
-                    continue
-                with self.lock:
-                    has_session = peer in self.sessions
-                if has_session:
-                    continue
-                self.ensure_session(peer)
-            time.sleep(1.0)
 
 
 def main():
