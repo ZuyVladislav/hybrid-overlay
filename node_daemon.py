@@ -108,6 +108,7 @@ class NodeDaemon:
 
         # active connections (initiator only)
         self.conns: Dict[str, ConnState] = {}
+        self.preconnect_thread: Optional[threading.Thread] = None
 
     # ---------- address book ----------
     def peer_addr(self, peer: str) -> Tuple[str, int]:
@@ -439,6 +440,10 @@ class NodeDaemon:
         random.shuffle(cand_x2)
 
         for x2 in cand_x2:
+            with self.lock:
+                has_session = x2 in self.sessions
+            if not has_session:
+                self.logger.warning(f"[I1] no session to X2={x2}, trying next")
             if not self.ensure_session(x2):
                 self.logger.warning(f"[I1] cannot establish session to X2={x2}, trying next")
                 continue
@@ -570,8 +575,10 @@ class NodeDaemon:
             return
         nxt = route[nxt_idx]
 
-        if nxt not in self.sessions and not self.ensure_session(nxt):
-            self.logger.error(f"[PROXY] cannot ensure session to {nxt}")
+        with self.lock:
+            has_session = nxt in self.sessions
+        if not has_session:
+            self.logger.error(f"[PROXY] no session to {nxt}")
             self.send_error_back(conn_id, src_u, x1_u, phase, code="NO_SESSION_NEXT", msg=f"cannot ensure {nxt}")
             return
 
@@ -767,6 +774,9 @@ class NodeDaemon:
 
     def serve_forever(self):
         self.logger.info(f"Daemon started as {self.name} on UDP/{USERS[self.name]['port']}")
+        if not self.preconnect_thread:
+            self.preconnect_thread = threading.Thread(target=self._preconnect_loop, daemon=True)
+            self.preconnect_thread.start()
         while self.running:
             got = self.recv_one()
             if not got:
@@ -780,6 +790,18 @@ class NodeDaemon:
             self.sock.close()
         except Exception:
             pass
+
+    def _preconnect_loop(self):
+        while self.running:
+            for peer in USERS.keys():
+                if peer == self.name:
+                    continue
+                with self.lock:
+                    has_session = peer in self.sessions
+                if has_session:
+                    continue
+                self.ensure_session(peer)
+            time.sleep(1.0)
 
 
 def main():
