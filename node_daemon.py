@@ -462,6 +462,8 @@ class NodeDaemon:
                 has_session = x2 in self.sessions
             if not has_session:
                 self.logger.warning(f"[I1] no session to X2={x2}, trying next")
+            if not self.ensure_session(x2):
+                self.logger.warning(f"[I1] cannot establish session to X2={x2}, trying next")
                 continue
 
             # I2: X1->X2
@@ -822,6 +824,16 @@ class NodeDaemon:
                 self.ensure_session(peer)
                 time.sleep(0.05)
             time.sleep(0.5)
+        while self.running:
+            for peer in USERS.keys():
+                if peer == self.name:
+                    continue
+                with self.lock:
+                    has_session = peer in self.sessions
+                if has_session:
+                    continue
+                self.ensure_session(peer)
+            time.sleep(1.0)
 
 
 def main():
