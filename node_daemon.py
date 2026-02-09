@@ -18,6 +18,7 @@ import secrets
 import socket
 import threading
 import random
+import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -682,7 +683,23 @@ class NodeDaemon:
             self.link_send(st.x1, T_I1, i1)
             self.logger.info(f"[CONN {st.conn_id}] I1 sent to X1={st.x1} (X1 picks X2)")
 
-            if not st.okx2_event.wait(UDP_TIMEOUT_S * 6):
+            okx2_timeout = UDP_TIMEOUT_S * 6
+            deadline = time.monotonic() + okx2_timeout
+            while time.monotonic() < deadline:
+                if st.okx2_event.wait(0.1):
+                    break
+                if st.done_event.is_set():
+                    self.logger.warning(
+                        f"[CONN {st.conn_id}] FAIL {st.last_error}, retry_left={st.retries_left}"
+                    )
+                    st.retries_left -= 1
+                    st.x1 = self._pick_new_x1(st.src)
+                    break
+
+            if st.done_event.is_set():
+                continue
+
+            if not st.okx2_event.is_set():
                 self.logger.error(f"[CONN {st.conn_id}] timeout waiting OKX2")
                 st.retries_left -= 1
                 st.x1 = self._pick_new_x1(st.src)
