@@ -108,7 +108,6 @@ class NodeDaemon:
 
         # active connections (initiator only)
         self.conns: Dict[str, ConnState] = {}
-        self.preconnect_thread: Optional[threading.Thread] = None
         self.ensure_inflight: Dict[str, threading.Event] = {}
 
     # ---------- address book ----------
@@ -793,9 +792,6 @@ class NodeDaemon:
 
     def serve_forever(self):
         self.logger.info(f"Daemon started as {self.name} on UDP/{USERS[self.name]['port']}")
-        if not self.preconnect_thread:
-            self.preconnect_thread = threading.Thread(target=self._preconnect_loop, daemon=True)
-            self.preconnect_thread.start()
         while self.running:
             got = self.recv_one()
             if not got:
@@ -828,32 +824,6 @@ class NodeDaemon:
             phase="OKX2", code="NO_SESSION_X2", msg="cannot ensure any X2"
         )
         return
-    def _preconnect_loop(self):
-        time.sleep(random.uniform(0.2, 0.8))
-        while self.running:
-            peers = [u for u in USERS.keys() if u != self.name]
-            random.shuffle(peers)
-            for peer in peers:
-                if peer == self.name:
-                    continue
-                with self.lock:
-                    has_session = peer in self.sessions or peer in self.ensure_inflight
-                if has_session:
-                    continue
-                self.ensure_session(peer)
-                time.sleep(0.05)
-            time.sleep(0.5)
-        while self.running:
-            for peer in USERS.keys():
-                if peer == self.name:
-                    continue
-                with self.lock:
-                    has_session = peer in self.sessions
-                if has_session:
-                    continue
-                self.ensure_session(peer)
-            time.sleep(1.0)
-
 
 def main():
     ap = argparse.ArgumentParser()
