@@ -298,7 +298,7 @@ class NodeDaemon:
     # MGMT initiator (ensure_session)
     # =========================
 
-    def ensure_session(self, peer: str) -> bool:
+    def ensure_session(self, peer: str, reason: str = "") -> bool:
         with self.lock:
             if peer in self.sessions:
                 return True
@@ -317,6 +317,9 @@ class NodeDaemon:
         label = f"{self.name}-{peer}"  # initiator-responder
 
         for attempt in range(RETRIES):
+            if attempt == 0:
+                reason_str = reason or "unspecified"
+                self.logger.info(f"[MGMT] ensure_session start {self.name}->{peer} reason={reason_str}")
             sid = secrets.token_hex(8)
             init_ev = threading.Event()
             auth_ev = threading.Event()
@@ -338,7 +341,7 @@ class NodeDaemon:
             self.logger.info(f"[MGMT] -> {peer} INIT sid={sid} attempt={attempt+1}")
 
             if not init_ev.wait(UDP_TIMEOUT_S):
-                self.logger.warning(f"[MGMT] timeout INIT_RESP from {peer} sid={sid}")
+                self.logger.warning(f"[MGMT] timeout INIT_RESP from {peer} sid={sid} reason={reason or 'unspecified'}")
                 self._cleanup_hs(sid)
                 continue
 
@@ -346,7 +349,7 @@ class NodeDaemon:
                 resp = self.hs_initresp.get(sid)
 
             if not resp or resp.get("from") != peer or resp.get("to") != self.name:
-                self.logger.warning(f"[MGMT] bad INIT_RESP mailbox sid={sid}")
+                self.logger.warning(f"[MGMT] bad INIT_RESP mailbox sid={sid} reason={reason or 'unspecified'}")
                 self._cleanup_hs(sid)
                 continue
 
@@ -363,7 +366,7 @@ class NodeDaemon:
             self.send_peer(peer, auth_msg)
 
             if not auth_ev.wait(UDP_TIMEOUT_S):
-                self.logger.warning(f"[MGMT] timeout AUTH_RESP from {peer} sid={sid}")
+                self.logger.warning(f"[MGMT] timeout AUTH_RESP from {peer} sid={sid} reason={reason or 'unspecified'}")
                 self._cleanup_hs(sid)
                 continue
 
@@ -371,7 +374,7 @@ class NodeDaemon:
                 resp2 = self.hs_authresp.get(sid)
 
             if not resp2 or resp2.get("from") != peer or resp2.get("to") != self.name:
-                self.logger.warning(f"[MGMT] bad AUTH_RESP mailbox sid={sid}")
+                self.logger.warning(f"[MGMT] bad AUTH_RESP mailbox sid={sid} reason={reason or 'unspecified'}")
                 self._cleanup_hs(sid)
                 continue
 
@@ -541,7 +544,7 @@ class NodeDaemon:
         if self.name != req:
             if req not in USERS:
                 return
-            if req not in self.sessions and not self.ensure_session(req):
+            if req not in self.sessions and not self.ensure_session(req, reason=f"OKX2 forward CONN={conn_id}"):
                 self.logger.error(f"[OKX2] cannot ensure session to {req}")
                 return
             self.link_send(req, T_OKX2, plain)
@@ -674,6 +677,10 @@ class NodeDaemon:
         ike_init_len = int(p.get("ike_init_len", 499))
         ike_auth_len = int(p.get("ike_auth_len", 499))
         retries = int(p.get("retries", 5))
+        self.logger.info(
+            f"[LOCAL] connect request from={src[0]} user={user} dst={dst} "
+            f"ike_init_len={ike_init_len} ike_auth_len={ike_auth_len} retries={retries}"
+        )
 
         if user != self.name:
             self.sock.sendto(err("BAD_SRC", "LOCAL_CONNECT user must equal daemon name"), src)
@@ -721,7 +728,7 @@ class NodeDaemon:
             st.okx2_event.clear()
             st.last_error = None
 
-            if st.x1 not in self.sessions and not self.ensure_session(st.x1):
+            if st.x1 not in self.sessions and not self.ensure_session(st.x1, reason=f"A->X1 CONN={st.conn_id}"):
                 self.logger.error(f"[CONN {st.conn_id}] cannot establish to X1={st.x1}")
                 st.retries_left -= 1
                 st.x1 = self._pick_new_x1(st.src)
