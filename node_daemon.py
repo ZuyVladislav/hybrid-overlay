@@ -18,6 +18,7 @@ import secrets
 import socket
 import threading
 import random
+import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -107,6 +108,7 @@ class NodeDaemon:
 
         # active connections (initiator only)
         self.conns: Dict[str, ConnState] = {}
+        self.ensure_inflight: Dict[str, threading.Event] = {}
 
     # ---------- address book ----------
     def peer_addr(self, peer: str) -> Tuple[str, int]:
@@ -295,14 +297,28 @@ class NodeDaemon:
     # MGMT initiator (ensure_session)
     # =========================
 
-    def ensure_session(self, peer: str) -> bool:
+    def ensure_session(self, peer: str, reason: str = "") -> bool:
         with self.lock:
             if peer in self.sessions:
                 return True
+            inflight = self.ensure_inflight.get(peer)
+            if inflight:
+                wait_ev = inflight
+            else:
+                wait_ev = threading.Event()
+                self.ensure_inflight[peer] = wait_ev
+
+        if inflight:
+            wait_ev.wait(UDP_TIMEOUT_S * RETRIES)
+            with self.lock:
+                return peer in self.sessions
 
         label = f"{self.name}-{peer}"  # initiator-responder
 
         for attempt in range(RETRIES):
+            if attempt == 0:
+                reason_str = reason or "unspecified"
+                self.logger.info(f"[MGMT] ensure_session start {self.name}->{peer} reason={reason_str}")
             sid = secrets.token_hex(8)
             init_ev = threading.Event()
             auth_ev = threading.Event()
@@ -324,7 +340,9 @@ class NodeDaemon:
             self.logger.info(f"[MGMT] -> {peer} INIT sid={sid} attempt={attempt+1}")
 
             if not init_ev.wait(UDP_TIMEOUT_S):
-                self.logger.warning(f"[MGMT] timeout INIT_RESP from {peer} sid={sid}")
+                self.logger.warning(
+                    f"[MGMT] timeout INIT_RESP from {peer} sid={sid} reason={reason or 'unspecified'}"
+                )
                 self._cleanup_hs(sid)
                 continue
 
@@ -332,7 +350,7 @@ class NodeDaemon:
                 resp = self.hs_initresp.get(sid)
 
             if not resp or resp.get("from") != peer or resp.get("to") != self.name:
-                self.logger.warning(f"[MGMT] bad INIT_RESP mailbox sid={sid}")
+                self.logger.warning(f"[MGMT] bad INIT_RESP mailbox sid={sid} reason={reason or 'unspecified'}")
                 self._cleanup_hs(sid)
                 continue
 
@@ -349,7 +367,9 @@ class NodeDaemon:
             self.send_peer(peer, auth_msg)
 
             if not auth_ev.wait(UDP_TIMEOUT_S):
-                self.logger.warning(f"[MGMT] timeout AUTH_RESP from {peer} sid={sid}")
+                self.logger.warning(
+                    f"[MGMT] timeout AUTH_RESP from {peer} sid={sid} reason={reason or 'unspecified'}"
+                )
                 self._cleanup_hs(sid)
                 continue
 
@@ -357,7 +377,7 @@ class NodeDaemon:
                 resp2 = self.hs_authresp.get(sid)
 
             if not resp2 or resp2.get("from") != peer or resp2.get("to") != self.name:
-                self.logger.warning(f"[MGMT] bad AUTH_RESP mailbox sid={sid}")
+                self.logger.warning(f"[MGMT] bad AUTH_RESP mailbox sid={sid} reason={reason or 'unspecified'}")
                 self._cleanup_hs(sid)
                 continue
 
@@ -373,9 +393,15 @@ class NodeDaemon:
                 self.sessions[peer] = MgmtSession(peer=peer, sid=sid, key=kd)
 
             self._cleanup_hs(sid)
-            self.logger.info(f"[MGMT] EST {self.name}<->{peer} sid={sid}")
+            self.logger.info(f"[MGMT] EST {self.name}<->{peer} sid={sid} reason={reason or 'unspecified'}")
+            with self.lock:
+                self.ensure_inflight.pop(peer, None)
+                wait_ev.set()
             return True
 
+        with self.lock:
+            self.ensure_inflight.pop(peer, None)
+            wait_ev.set()
         return False
 
     def _cleanup_hs(self, sid: str):
@@ -433,19 +459,18 @@ class NodeDaemon:
             self.logger.error("[I1] unknown REQ/DST")
             return
 
-        # X1 chooses X2 randomly excluding only itself
+        # X1 chooses X2 randomly excluding only itself; retry across candidates
         cand_x2 = [u for u in USERS.keys() if u != self.name]
-        x2 = random.choice(cand_x2)
+        random.shuffle(cand_x2)
 
-        if not self.ensure_session(x2):
-            self.logger.error(f"[I1] cannot establish session to X2={x2}")
-            self.send_error_back(conn_id, req, self.name, phase="OKX2", code="NO_SESSION_X2", msg=f"cannot ensure {x2}")
-            return
-
-        # I2: X1->X2
-        i2 = f"CONN={conn_id}|REQ={req}|DST={dst}|X2={x2}".encode().ljust(128, b"\x00")
-        self.link_send(x2, T_I2, i2)
-        self.logger.info(f"[I1] choose X2={x2}; -> I2 to {x2} for REQ={req}, DST={dst}")
+        self.logger.info(f"[ROLE] X1={self.name} selected by A={req} for DST={dst} CONN={conn_id}")
+        th = threading.Thread(
+            target=self._try_route_x2,
+            args=(conn_id, req, dst, cand_x2),
+            daemon=True,
+        )
+        th.start()
+        return
 
     # I2: X1->X2
     def handle_I2(self, peer: str, plain: bytes):
@@ -460,6 +485,8 @@ class NodeDaemon:
         if not conn_id or not req or not dst or not x2:
             self.logger.error("[I2] bad fields")
             return
+
+        self.logger.info(f"[ROLE] X2={self.name} for REQ={req} DST={dst} CONN={conn_id}")
 
         # ✅ Reject case: I'm X2 and I'm also destination (X2 == B)
         if self.name == dst:
@@ -499,7 +526,7 @@ class NodeDaemon:
         if self.name != req:
             if req not in USERS:
                 return
-            if req not in self.sessions and not self.ensure_session(req):
+            if req not in self.sessions and not self.ensure_session(req, reason=f"OKX2 forward CONN={conn_id}"):
                 self.logger.error(f"[OKX2] cannot ensure session to {req}")
                 return
             self.link_send(req, T_OKX2, plain)
@@ -513,6 +540,7 @@ class NodeDaemon:
             self.okx2_x2name[conn_id] = x2
         if ev:
             ev.set()
+        self.logger.info(f"[ROLE] A={self.name} got OKX2 from X2={x2} via {peer} CONN={conn_id}")
 
     # PROXY_BLOB forward path: src->x1->x2->dst; back path: dst->x2->x1->src
     def handle_PROXY(self, peer: str, plain: bytes, meta: dict):
@@ -561,15 +589,20 @@ class NodeDaemon:
             return
         nxt = route[nxt_idx]
 
-        if nxt not in self.sessions and not self.ensure_session(nxt):
-            self.logger.error(f"[PROXY] cannot ensure session to {nxt}")
+        with self.lock:
+            has_session = nxt in self.sessions
+        if not has_session:
+            self.logger.error(f"[PROXY] no session to {nxt}")
             self.send_error_back(conn_id, src_u, x1_u, phase, code="NO_SESSION_NEXT", msg=f"cannot ensure {nxt}")
             return
 
         meta2 = dict(meta)
         meta2["idx"] = nxt_idx
         self.link_send(nxt, T_PROXY_BLOB, payload, meta=meta2)
-        self.logger.info(f"[PROXY] {direction} {self.name}->{nxt} idx={nxt_idx} phase={phase} CONN={conn_id}")
+        self.logger.info(
+            f"[PROXY] {direction} {self.name}->{nxt} idx={nxt_idx} phase={phase} "
+            f"route={src_u}->{x1_u}->{x2_u}->{dst_u} CONN={conn_id}"
+        )
 
     # =========================
     # Plaintext ERROR forward
@@ -626,6 +659,10 @@ class NodeDaemon:
         ike_init_len = int(p.get("ike_init_len", 499))
         ike_auth_len = int(p.get("ike_auth_len", 499))
         retries = int(p.get("retries", 5))
+        self.logger.info(
+            f"[LOCAL] connect request from={src[0]} user={user} dst={dst} "
+            f"ike_init_len={ike_init_len} ike_auth_len={ike_auth_len} retries={retries}"
+        )
 
         if user != self.name:
             self.sock.sendto(err("BAD_SRC", "LOCAL_CONNECT user must equal daemon name"), src)
@@ -665,6 +702,7 @@ class NodeDaemon:
         th.start()
 
         self.sock.sendto(jdump({"ok": True, "conn_id": conn_id, "x1": x1, "msg": "started"}), src)
+        self.logger.info(f"[ROLE] A={user} selected X1={x1} for DST={dst} CONN={conn_id}")
 
     def run_connection(self, st: ConnState):
         while st.retries_left >= 0:
@@ -672,7 +710,7 @@ class NodeDaemon:
             st.okx2_event.clear()
             st.last_error = None
 
-            if st.x1 not in self.sessions and not self.ensure_session(st.x1):
+            if st.x1 not in self.sessions and not self.ensure_session(st.x1, reason=f"A->X1 CONN={st.conn_id}"):
                 self.logger.error(f"[CONN {st.conn_id}] cannot establish to X1={st.x1}")
                 st.retries_left -= 1
                 st.x1 = self._pick_new_x1(st.src)
@@ -682,7 +720,23 @@ class NodeDaemon:
             self.link_send(st.x1, T_I1, i1)
             self.logger.info(f"[CONN {st.conn_id}] I1 sent to X1={st.x1} (X1 picks X2)")
 
-            if not st.okx2_event.wait(UDP_TIMEOUT_S * 6):
+            okx2_timeout = UDP_TIMEOUT_S * 6
+            deadline = time.monotonic() + okx2_timeout
+            while time.monotonic() < deadline:
+                if st.okx2_event.wait(0.1):
+                    break
+                if st.done_event.is_set():
+                    self.logger.warning(
+                        f"[CONN {st.conn_id}] FAIL {st.last_error}, retry_left={st.retries_left}"
+                    )
+                    st.retries_left -= 1
+                    st.x1 = self._pick_new_x1(st.src)
+                    break
+
+            if st.done_event.is_set():
+                continue
+
+            if not st.okx2_event.is_set():
                 self.logger.error(f"[CONN {st.conn_id}] timeout waiting OKX2")
                 st.retries_left -= 1
                 st.x1 = self._pick_new_x1(st.src)
@@ -755,6 +809,25 @@ class NodeDaemon:
             self.sock.close()
         except Exception:
             pass
+
+    def _try_route_x2(self, conn_id: str, req: str, dst: str, cand_x2: list[str]):
+        for x2 in cand_x2:
+            self.logger.info(f"[I1] X1={self.name} try X2={x2} for REQ={req} DST={dst} CONN={conn_id}")
+            if not self.ensure_session(x2, reason=f"X1->X2 CONN={conn_id} REQ={req} DST={dst}"):
+                self.logger.warning(f"[I1] cannot establish session to X2={x2}, trying next")
+                continue
+
+            i2 = f"CONN={conn_id}|REQ={req}|DST={dst}|X2={x2}".encode().ljust(128, b"\x00")
+            self.link_send(x2, T_I2, i2)
+            self.logger.info(f"[I1] choose X2={x2}; -> I2 to {x2} for REQ={req}, DST={dst} CONN={conn_id}")
+            return
+
+        self.logger.error("[I1] cannot establish session to any X2 candidate")
+        self.send_error_back(
+            conn_id, req, self.name,
+            phase="OKX2", code="NO_SESSION_X2", msg="cannot ensure any X2"
+        )
+        return
 
 
 def main():
