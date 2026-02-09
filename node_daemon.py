@@ -457,6 +457,14 @@ class NodeDaemon:
         cand_x2 = [u for u in USERS.keys() if u != self.name]
         random.shuffle(cand_x2)
 
+        self.logger.info(f"[ROLE] X1={self.name} selected by A={req} for DST={dst} CONN={conn_id}")
+        th = threading.Thread(
+            target=self._try_route_x2,
+            args=(conn_id, req, dst, cand_x2),
+            daemon=True,
+        )
+        th.start()
+
         for x2 in cand_x2:
             with self.lock:
                 has_session = x2 in self.sessions
@@ -492,6 +500,8 @@ class NodeDaemon:
         if not conn_id or not req or not dst or not x2:
             self.logger.error("[I2] bad fields")
             return
+
+        self.logger.info(f"[ROLE] X2={self.name} for REQ={req} DST={dst} CONN={conn_id}")
 
         # ✅ Reject case: I'm X2 and I'm also destination (X2 == B)
         if self.name == dst:
@@ -545,6 +555,7 @@ class NodeDaemon:
             self.okx2_x2name[conn_id] = x2
         if ev:
             ev.set()
+        self.logger.info(f"[ROLE] A={self.name} got OKX2 from X2={x2} via {peer} CONN={conn_id}")
 
     # PROXY_BLOB forward path: src->x1->x2->dst; back path: dst->x2->x1->src
     def handle_PROXY(self, peer: str, plain: bytes, meta: dict):
@@ -603,7 +614,10 @@ class NodeDaemon:
         meta2 = dict(meta)
         meta2["idx"] = nxt_idx
         self.link_send(nxt, T_PROXY_BLOB, payload, meta=meta2)
-        self.logger.info(f"[PROXY] {direction} {self.name}->{nxt} idx={nxt_idx} phase={phase} CONN={conn_id}")
+        self.logger.info(
+            f"[PROXY] {direction} {self.name}->{nxt} idx={nxt_idx} phase={phase} "
+            f"route={src_u}->{x1_u}->{x2_u}->{dst_u} CONN={conn_id}"
+        )
 
     # =========================
     # Plaintext ERROR forward
@@ -699,6 +713,7 @@ class NodeDaemon:
         th.start()
 
         self.sock.sendto(jdump({"ok": True, "conn_id": conn_id, "x1": x1, "msg": "started"}), src)
+        self.logger.info(f"[ROLE] A={user} selected X1={x1} for DST={dst} CONN={conn_id}")
 
     def run_connection(self, st: ConnState):
         while st.retries_left >= 0:
@@ -809,6 +824,24 @@ class NodeDaemon:
         except Exception:
             pass
 
+    def _try_route_x2(self, conn_id: str, req: str, dst: str, cand_x2: list[str]):
+        for x2 in cand_x2:
+            self.logger.info(f"[I1] X1={self.name} try X2={x2} for REQ={req} DST={dst} CONN={conn_id}")
+            if not self.ensure_session(x2):
+                self.logger.warning(f"[I1] cannot establish session to X2={x2}, trying next")
+                continue
+
+            i2 = f"CONN={conn_id}|REQ={req}|DST={dst}|X2={x2}".encode().ljust(128, b"\x00")
+            self.link_send(x2, T_I2, i2)
+            self.logger.info(f"[I1] choose X2={x2}; -> I2 to {x2} for REQ={req}, DST={dst} CONN={conn_id}")
+            return
+
+        self.logger.error("[I1] cannot establish session to any X2 candidate")
+        self.send_error_back(
+            conn_id, req, self.name,
+            phase="OKX2", code="NO_SESSION_X2", msg="cannot ensure any X2"
+        )
+        return
     def _preconnect_loop(self):
         time.sleep(random.uniform(0.2, 0.8))
         while self.running:
