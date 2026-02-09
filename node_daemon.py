@@ -108,6 +108,7 @@ class NodeDaemon:
 
         # active connections (initiator only)
         self.conns: Dict[str, ConnState] = {}
+        self.preconnect_thread: Optional[threading.Thread] = None
         self.ensure_inflight: Dict[str, threading.Event] = {}
 
     # ---------- address book ----------
@@ -389,7 +390,7 @@ class NodeDaemon:
                 self.sessions[peer] = MgmtSession(peer=peer, sid=sid, key=kd)
 
             self._cleanup_hs(sid)
-            self.logger.info(f"[MGMT] EST {self.name}<->{peer} sid={sid} reason={reason or 'unspecified'}")
+            self.logger.info(f"[MGMT] EST {self.name}<->{peer} sid={sid}")
             with self.lock:
                 self.ensure_inflight.pop(peer, None)
                 wait_ev.set()
@@ -466,6 +467,27 @@ class NodeDaemon:
             daemon=True,
         )
         th.start()
+
+        for x2 in cand_x2:
+            with self.lock:
+                has_session = x2 in self.sessions
+            if not has_session:
+                self.logger.warning(f"[I1] no session to X2={x2}, trying next")
+            if not self.ensure_session(x2):
+                self.logger.warning(f"[I1] cannot establish session to X2={x2}, trying next")
+                continue
+
+            # I2: X1->X2
+            i2 = f"CONN={conn_id}|REQ={req}|DST={dst}|X2={x2}".encode().ljust(128, b"\x00")
+            self.link_send(x2, T_I2, i2)
+            self.logger.info(f"[I1] choose X2={x2}; -> I2 to {x2} for REQ={req}, DST={dst}")
+            return
+
+        self.logger.error("[I1] cannot establish session to any X2 candidate")
+        self.send_error_back(
+            conn_id, req, self.name,
+            phase="OKX2", code="NO_SESSION_X2", msg="cannot ensure any X2"
+        )
         return
 
     # I2: X1->X2
@@ -792,6 +814,9 @@ class NodeDaemon:
 
     def serve_forever(self):
         self.logger.info(f"Daemon started as {self.name} on UDP/{USERS[self.name]['port']}")
+        if not self.preconnect_thread:
+            self.preconnect_thread = threading.Thread(target=self._preconnect_loop, daemon=True)
+            self.preconnect_thread.start()
         while self.running:
             got = self.recv_one()
             if not got:
@@ -809,7 +834,7 @@ class NodeDaemon:
     def _try_route_x2(self, conn_id: str, req: str, dst: str, cand_x2: list[str]):
         for x2 in cand_x2:
             self.logger.info(f"[I1] X1={self.name} try X2={x2} for REQ={req} DST={dst} CONN={conn_id}")
-            if not self.ensure_session(x2, reason=f"X1->X2 CONN={conn_id} REQ={req} DST={dst}"):
+            if not self.ensure_session(x2):
                 self.logger.warning(f"[I1] cannot establish session to X2={x2}, trying next")
                 continue
 
@@ -824,6 +849,31 @@ class NodeDaemon:
             phase="OKX2", code="NO_SESSION_X2", msg="cannot ensure any X2"
         )
         return
+    def _preconnect_loop(self):
+        time.sleep(random.uniform(0.2, 0.8))
+        while self.running:
+            peers = [u for u in USERS.keys() if u != self.name]
+            random.shuffle(peers)
+            for peer in peers:
+                if peer == self.name:
+                    continue
+                with self.lock:
+                    has_session = peer in self.sessions or peer in self.ensure_inflight
+                if has_session:
+                    continue
+                self.ensure_session(peer)
+                time.sleep(0.05)
+            time.sleep(0.5)
+        while self.running:
+            for peer in USERS.keys():
+                if peer == self.name:
+                    continue
+                with self.lock:
+                    has_session = peer in self.sessions
+                if has_session:
+                    continue
+                self.ensure_session(peer)
+            time.sleep(1.0)
 
 
 def main():
