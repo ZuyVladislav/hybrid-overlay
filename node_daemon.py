@@ -203,10 +203,44 @@ class NodeDaemon:
     def handle_packet(self, data: bytes, src: Tuple[str, int]):
         peer = self.peer_from_src(src)
         p = self.safe_load(data)
+
         if not p:
             return
 
         t = p.get("t")
+        claimed = p.get("from")
+
+        # --- simple mgmt identity fix ---
+        if peer is None and claimed in USERS:
+            # if source IP matches known user, accept peer even if port differs
+            if USERS[claimed]["ip"] == src[0]:
+                if t in (
+                        T_MGMT_INIT,
+                        T_MGMT_AUTH,
+                        T_MGMT_INIT_RESP,
+                        T_MGMT_AUTH_RESP,
+                        T_ERROR,
+                ):
+                    peer = claimed
+                    exp_ip, exp_port = self.peer_addr(peer)
+                    self.logger.warning(
+                        f"[ADDR] peer fixed by IP match: peer={peer} "
+                        f"src={src} expected=({exp_ip},{exp_port}) "
+                        f"port_mismatch={src[1] != exp_port} t={t}"
+                    )
+                else:
+                    # secure traffic still requires strict peer match
+                    self.logger.warning(
+                        f"[ADDR] drop secure msg from unknown endpoint src={src} claimed={claimed} t={t}"
+                    )
+                    return
+
+        if peer is None:
+            self.logger.warning(
+                f"[ADDR] drop packet: src={src} claimed={claimed} t={t}"
+            )
+            return
+        # --- end fix ---
 
         if t == T_LOCAL_CONNECT:
             self.on_local_connect(p, src)
@@ -216,6 +250,7 @@ class NodeDaemon:
         if t == T_MGMT_INIT:
             self.on_mgmt_init(p, peer)
             return
+
         if t == T_MGMT_AUTH:
             self.on_mgmt_auth(p, peer)
             return
@@ -366,7 +401,10 @@ class NodeDaemon:
             self.logger.info(f"[MGMT] -> {peer} INIT sid={sid} attempt={attempt+1}")
 
             if not init_ev.wait(UDP_TIMEOUT_S):
-                self.logger.warning(f"[MGMT] timeout INIT_RESP from {peer} sid={sid} reason={reason or 'unspecified'}")
+                exp = self.peer_addr(peer)
+                self.logger.warning(
+                    f"[MGMT] timeout INIT_RESP from {peer} sid={sid} expected={exp} reason={reason or 'unspecified'}"
+                )
                 self._cleanup_hs(sid)
                 continue
 
@@ -391,7 +429,10 @@ class NodeDaemon:
             self.send_peer(peer, auth_msg)
 
             if not auth_ev.wait(UDP_TIMEOUT_S):
-                self.logger.warning(f"[MGMT] timeout AUTH_RESP from {peer} sid={sid} reason={reason or 'unspecified'}")
+                exp = self.peer_addr(peer)
+                self.logger.warning(
+                    f"[MGMT] timeout AUTH_RESP from {peer} sid={sid} expected={exp} reason={reason or 'unspecified'}"
+                )
                 self._cleanup_hs(sid)
                 continue
 
@@ -731,7 +772,7 @@ class NodeDaemon:
             self.sock.sendto(err("BAD_DST", "unknown dst"), src)
             return
 
-        # ✅ A picks X1 excluding {A, DST}
+        # ✅ A picks X1
         cand_x1 = [u for u in USERS.keys() if u != user]
         if not cand_x1:
             self.sock.sendto(err("NO_X1_CAND", "no X1 candidates"), src)
