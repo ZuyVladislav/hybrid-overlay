@@ -122,6 +122,9 @@ class NodeDaemon:
         return USERS[peer]["ip"], USERS[peer]["port"]
 
     def send_peer(self, peer: str, payload: bytes):
+        if peer == self.name:
+        self.logger.error(f"[BUG] attempt to send to self peer={peer} DROP")
+        return
         ip, port = self.peer_addr(peer)
         self.sock.sendto(payload, (ip, port))
 
@@ -306,6 +309,9 @@ class NodeDaemon:
     # =========================
 
     def ensure_session(self, peer: str, reason: str = "") -> bool:
+        if peer == self.name:
+            self.logger.error(f"[MGMT] ensure_session to self is forbidden, reason={reason}")
+            return False
         with self.lock:
             if peer in self.sessions:
                 return True
@@ -498,8 +504,12 @@ class NodeDaemon:
 
         # hard rejects (should not happen now, but keep safety)
         if self.name == dst:
-            self.logger.warning(f"[I2] REJECT: X2==DST ({self.name}) CONN={conn_id} REQ={req}")
-            self.send_error_back(conn_id, req, peer, phase="OKX2", code="DEST_IS_X2", msg="X2 became destination; drop+retry")
+            self.logger.warning(
+                f"[I2] DROP: I am DST={dst} but was selected as X2. "
+                f"CONN={conn_id} REQ={req} via X1={peer}"
+            )
+            self.send_error_back(conn_id, req, peer, phase="I2", code="X2_IS_DST",
+                                 msg="X2 equals destination (B). Drop connection and retry.")
             return
         if self.name == req:
             self.logger.warning(f"[I2] REJECT: X2==REQ ({self.name}) CONN={conn_id} REQ={req}")
