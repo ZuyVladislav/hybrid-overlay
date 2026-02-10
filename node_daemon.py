@@ -470,7 +470,7 @@ class NodeDaemon:
             return
 
         # ✅ X1 chooses X2 excluding {X1, REQ, DST}
-        cand_x2 = [u for u in USERS.keys() if u not in (self.name, req, dst)]
+        cand_x2 = [u for u in USERS.keys() if u != self.name]
         random.shuffle(cand_x2)
 
         if not cand_x2:
@@ -500,7 +500,23 @@ class NodeDaemon:
             self.logger.error("[I2] bad fields")
             return
 
-        self.logger.info(f"[ROLE] X2={self.name} for REQ={req} DST={dst} CONN={conn_id}")
+        # X2 == DST (B) — допустимая ситуация по генерации маршрута, но в твоей логике
+        # X2 обязан явно сбросить установку и сообщить наверх "увидел себя".
+        if self.name == dst:
+            self.logger.warning(
+                f"[I2] DROP (X2==DST): I am DST={dst} and was selected as X2. "
+                f"CONN={conn_id} REQ={req} via X1={peer}"
+            )
+            # шлём ошибку назад (к A через X1), чтобы A сделал retry и было видно почему
+            self.send_error_back(
+                conn_id=conn_id,
+                src_u=req,
+                x1_u=peer,
+                phase="I2",
+                code="X2_IS_DST",
+                msg="X2 увидел себя как DST (B) и сбросил соединение"
+            )
+            return
 
         # hard rejects (should not happen now, but keep safety)
         if self.name == dst:
@@ -510,10 +526,6 @@ class NodeDaemon:
             )
             self.send_error_back(conn_id, req, peer, phase="I2", code="X2_IS_DST",
                                  msg="X2 equals destination (B). Drop connection and retry.")
-            return
-        if self.name == req:
-            self.logger.warning(f"[I2] REJECT: X2==REQ ({self.name}) CONN={conn_id} REQ={req}")
-            self.send_error_back(conn_id, req, peer, phase="OKX2", code="REQ_IS_X2", msg="X2 became requester; drop+retry")
             return
 
         ok = secrets.token_bytes(32) + secrets.token_bytes(16)
@@ -618,6 +630,9 @@ class NodeDaemon:
 
         meta2 = dict(meta)
         meta2["idx"] = nxt_idx
+        if nxt == self.name:
+            self.logger.error(f"[PROXY] BUG: next hop is self, drop. meta={meta}")
+            return
         self.link_send(nxt, T_PROXY_BLOB, payload, meta=meta2)
         self.logger.info(
             f"[PROXY] {direction} {self.name}->{nxt} idx={nxt_idx} phase={phase} "
@@ -696,7 +711,7 @@ class NodeDaemon:
             return
 
         # ✅ A picks X1 excluding {A, DST}
-        cand_x1 = [u for u in USERS.keys() if u not in (user, dst)]
+        cand_x1 = [u for u in USERS.keys() if u != user]
         if not cand_x1:
             self.sock.sendto(err("NO_X1_CAND", "no X1 candidates"), src)
             return
