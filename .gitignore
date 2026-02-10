@@ -1,0 +1,15 @@
+# IDE
+.idea/
+*.iml
+
+# Lock files
+*.lock
+
+# Logs
+*.log
+logs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
