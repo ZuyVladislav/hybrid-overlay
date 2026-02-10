@@ -6,6 +6,7 @@ import socket
 import threading
 import time
 
+from concurrent.futures import ThreadPoolExecutor
 from config import USERS, PRECONNECT_ENABLED
 from logging_util import setup_logger
 from protocol import (
@@ -88,6 +89,7 @@ class NodeDaemon:
 
         self.running = True
         self.preconnect_thread = None
+        self.exec = ThreadPoolExecutor(max_workers=8)
 
     def safe_load(self, data: bytes):
         try:
@@ -176,7 +178,7 @@ class NodeDaemon:
             self.err.on_error(p, peer)
             return
 
-        # secure overlay messages (STRICT peer only should have passed resolve_peer)
+        # secure overlay messages (dispatch to worker; never block recv-thread)
         if t in (T_I1, T_I2, T_OKX2, T_PROXY_BLOB):
             try:
                 plain = self.sec.link_decrypt(p)
@@ -185,13 +187,13 @@ class NodeDaemon:
                 return
 
             if t == T_I1:
-                self.router.handle_I1(peer, plain)
+                self.exec.submit(self.router.handle_I1, peer, plain)
             elif t == T_I2:
-                self.router.handle_I2(peer, plain)
+                self.exec.submit(self.router.handle_I2, peer, plain)
             elif t == T_OKX2:
-                self.router.handle_OKX2(peer, plain)
+                self.exec.submit(self.router.handle_OKX2, peer, plain)
             elif t == T_PROXY_BLOB:
-                self.proxy.handle_PROXY(peer, plain, p.get("meta") or {})
+                self.exec.submit(self.proxy.handle_PROXY, peer, plain, p.get("meta") or {})
             return
 
         self.logger.info(f"[DROP] unknown t={t} peer={peer} src={src}")
@@ -228,6 +230,11 @@ class NodeDaemon:
         self.running = False
         try:
             self.sock.close()
+        except Exception:
+            pass
+
+        try:
+            self.exec.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
 
