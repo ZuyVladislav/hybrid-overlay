@@ -3,7 +3,6 @@
 from typing import Dict
 
 # ЕДИНЫЙ справочник пользователей (это же узлы сети)
-# >>> СЮДА ВБИВАЕШЬ IP <<<
 USERS: Dict[str, dict] = {
     "User1": {"ip": "192.168.3.101", "port": 9000, "password": "1111"},
     "User2": {"ip": "192.168.3.102", "port": 9000, "password": "2222"},

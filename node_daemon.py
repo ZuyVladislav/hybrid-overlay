@@ -1,17 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-node_daemon.py (stable build)
-
-Fixes vs your current:
-- A picks X1 excluding {A, DST} (no X1==DST).
-- X1 picks X2 excluding {X1, REQ, DST} (no X2==REQ and no X2==DST).
-- PROXY hop now ensures session to next hop on-demand (ensure_session) instead of hard-failing.
-- preconnect_thread initialized.
-- clearer logs.
-
-Requires: config.py, crypto_util.py, logging_util.py, protocol.py
-"""
-
 import argparse
 import random
 import secrets
@@ -20,6 +6,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List
+from ike_proxy import IkeProxy
 
 from cryptography.hazmat.primitives.asymmetric import x25519
 
@@ -82,6 +69,10 @@ class NodeDaemon:
         self.name = name
         self.logger = setup_logger(name)
 
+        self.ike_route = None
+        self.ike_proxy = IkeProxy(self._on_ike_local, self.logger)
+        self.ike_proxy.start()
+
         if name not in USERS:
             raise RuntimeError(f"Unknown user {name} in config USERS")
 
@@ -142,6 +133,26 @@ class NodeDaemon:
         except Exception:
             self.logger.warning("Malformed packet (non-json)")
             return None
+
+    def _on_ike_local(self, data: bytes, dport: int):
+        if not self.ike_route:
+            return
+
+        meta = dict(self.ike_route)
+        meta.update({
+            "phase": "IKE_REAL",
+            "ike_port": dport,
+            "dir": "fwd",
+            "idx": 1,
+        })
+
+        try:
+            self.link_send(meta["x1"], T_PROXY_BLOB, data, meta=meta)
+        except Exception as e:
+            self.logger.error(f"[IKEP] inject into overlay failed: {e}")
+            return
+
+        self.logger.info(f"[IKEP] injected into overlay len={len(data)} dport={dport}")
 
     # ---------- mgmt KDF ----------
     def mgmt_kdf(self, shared: bytes, ni: bytes, nr: bytes, label: str) -> bytes:
@@ -585,6 +596,12 @@ class NodeDaemon:
         idx = int(meta.get("idx", 0))
         direction = meta.get("dir", "fwd")
         phase = meta.get("phase", "UNK")
+        if phase == "IKE_REAL":
+            # reached destination (B)
+            if direction == "fwd" and self.name == dst_u and idx == 3:
+                self.logger.info(f"[IKEP] ARRIVE B={self.name} dport={meta.get('ike_port')} len={len(plain)}")
+                self.ike_proxy.inject_to_charon(plain, int(meta.get("ike_port", 15000)))
+                return
 
         route_fwd = [src_u, x1_u, x2_u, dst_u]
         route_back = [dst_u, x2_u, x1_u, src_u]
@@ -797,6 +814,14 @@ class NodeDaemon:
 
             st.x2 = x2
             self.logger.info(f"[CONN {st.conn_id}] got OKX2, chosen X2={st.x2}, ok_len={len(ok)}")
+            self.ike_route = {
+                "conn_id": st.conn_id,
+                "src": st.src,
+                "dst": st.dst,
+                "x1": st.x1,
+                "x2": st.x2,
+            }
+            self.logger.info(f"[IKEP] route armed for real IKE: {st.src}->{st.x1}->{st.x2}->{st.dst}")
 
             init_payload = self.make_container(st.dst, ike_len=st.ike_init_len)
             auth_payload = self.make_container(st.dst, ike_len=st.ike_auth_len)
