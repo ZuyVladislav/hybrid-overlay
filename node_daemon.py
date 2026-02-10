@@ -123,8 +123,8 @@ class NodeDaemon:
 
     def send_peer(self, peer: str, payload: bytes):
         if peer == self.name:
-        self.logger.error(f"[BUG] attempt to send to self peer={peer} DROP")
-        return
+            self.logger.error(f"[BUG] attempt to send to self peer={peer} DROP")
+            return
         ip, port = self.peer_addr(peer)
         self.sock.sendto(payload, (ip, port))
 
