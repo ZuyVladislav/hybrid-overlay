@@ -1,4 +1,4 @@
-#
+##
 import argparse
 import random
 import secrets
