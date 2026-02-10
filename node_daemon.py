@@ -471,7 +471,10 @@ class NodeDaemon:
 
         # ✅ X1 chooses X2 excluding {X1, REQ, DST}
         cand_x2 = [u for u in USERS.keys() if u != self.name]
-        random.shuffle(cand_x2)
+        if not cand_x2:
+            self.sock.sendto(err("NO_X2_CAND", "no X2 candidates"), src)
+            return
+        x2 = random.choice(cand_x2)
 
         if not cand_x2:
             self.logger.error("[I1] no X2 candidates after exclusions")
