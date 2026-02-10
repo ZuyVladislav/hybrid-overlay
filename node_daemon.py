@@ -208,27 +208,38 @@ class NodeDaemon:
         t = p.get("t")
         claimed = p.get("from")
 
-        # ✅ 1) LOCAL_CONNECT всегда разрешаем с loopback, peer не нужен
+        # ✅ LOCAL control-plane: принимаем всегда (идёт с 127.0.0.1:random_port)
         if t == T_LOCAL_CONNECT:
             self.on_local_connect(p, src)
             return
 
         peer = self.peer_from_src(src)
 
-        # --- optional: IP-only fix for plaintext mgmt/errors (оставь как было, если хочешь) ---
+        # --- simple mgmt identity fix ---
         if peer is None and claimed in USERS:
+            # if source IP matches known user, accept peer even if port differs
             if USERS[claimed]["ip"] == src[0]:
-                if t in (T_MGMT_INIT, T_MGMT_AUTH, T_MGMT_INIT_RESP, T_MGMT_AUTH_RESP, T_ERROR):
+                if t in (
+                        T_MGMT_INIT,
+                        T_MGMT_AUTH,
+                        T_MGMT_INIT_RESP,
+                        T_MGMT_AUTH_RESP,
+                        T_ERROR,
+                ):
                     peer = claimed
-                    self.logger.warning(f"[ADDR] peer fixed by IP match: peer={peer} src={src} t={t}")
+                    self.logger.warning(
+                        f"[ADDR] peer fixed by IP match: peer={peer} src={src} t={t}"
+                    )
                 else:
                     self.logger.warning(
-                        f"[ADDR] drop secure msg from unknown endpoint src={src} claimed={claimed} t={t}")
+                        f"[ADDR] drop secure msg from unknown endpoint src={src} claimed={claimed} t={t}"
+                    )
                     return
 
         if peer is None:
             self.logger.warning(f"[ADDR] drop packet: src={src} claimed={claimed} t={t}")
             return
+        # --- end fix ---
 
         # mgmt responder
         if t == T_MGMT_INIT:
@@ -259,12 +270,10 @@ class NodeDaemon:
                     ev.set()
             return
 
-        # errors are plaintext
         if t == T_ERROR:
             self.on_error(p, peer)
             return
 
-        # secure messages
         if t in (T_I1, T_I2, T_OKX2, T_PROXY_BLOB):
             self.on_secure_msg(p, peer)
             return
@@ -386,7 +395,8 @@ class NodeDaemon:
             if not init_ev.wait(UDP_TIMEOUT_S):
                 exp = self.peer_addr(peer)
                 self.logger.warning(
-                    f"[MGMT] timeout INIT_RESP from {peer} sid={sid} expected={exp} reason={reason or 'unspecified'}"
+                    f"[MGMT] timeout INIT_RESP from {peer} sid={sid} "
+                    f"expected={exp} reason={reason or 'unspecified'}"
                 )
                 self._cleanup_hs(sid)
                 continue
@@ -414,7 +424,8 @@ class NodeDaemon:
             if not auth_ev.wait(UDP_TIMEOUT_S):
                 exp = self.peer_addr(peer)
                 self.logger.warning(
-                    f"[MGMT] timeout AUTH_RESP from {peer} sid={sid} expected={exp} reason={reason or 'unspecified'}"
+                    f"[MGMT] timeout AUTH_RESP from {peer} sid={sid} "
+                    f"expected={exp} reason={reason or 'unspecified'}"
                 )
                 self._cleanup_hs(sid)
                 continue
