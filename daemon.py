@@ -105,7 +105,7 @@ class NodeDaemon:
         except socket.timeout:
             return None
 
-    def _on_ike_local(self, data: bytes, dport: int):
+    def _on_ike_local(self, data: bytes, dport: int, src, orig_dst):
         if not self.ike_route:
             return
 
@@ -115,6 +115,12 @@ class NodeDaemon:
             "ike_port": dport,
             "dir": "fwd",
             "idx": 1,
+
+            # transparent endpoint metadata (TPROXY)
+            "peer_ip": src[0],
+            "peer_port": int(src[1]),
+            "orig_dst_ip": (orig_dst[0] if orig_dst else None),
+            "orig_dst_port": (int(orig_dst[1]) if orig_dst else None),
         })
 
         try:
@@ -123,7 +129,11 @@ class NodeDaemon:
             self.logger.error(f"[IKEP] inject into overlay failed: {e}")
             return
 
-        self.logger.info(f"[IKEP] injected into overlay len={len(data)} dport={dport}")
+        self.logger.info(
+            f"[IKEP] injected into overlay len={len(data)} dport={dport} "
+            f"peer={meta.get('peer_ip')}:{meta.get('peer_port')} "
+            f"orig_dst={meta.get('orig_dst_ip')}:{meta.get('orig_dst_port')}"
+        )
 
     def handle_packet(self, data: bytes, src):
         p = self.safe_load(data)

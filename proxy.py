@@ -27,11 +27,30 @@ class Proxy:
         direction = meta.get("dir", "fwd")
         phase = meta.get("phase", "UNK")
 
-        if phase == "IKE_REAL":
-            if direction == "fwd" and self.name == dst_u and idx == 3:
-                self.logger.info(f"[IKEP] ARRIVE B={self.name} dport={meta.get('ike_port')} len={len(plain)}")
-                self.ike_proxy.inject_to_charon(plain, int(meta.get("ike_port", 15000)))
-                return
+        if phase == "IKE_REAL" and idx == 3 and (self.name == dst_u or self.name == src_u):
+            ike_listen_port = int(meta.get("ike_port", 15000))
+            peer_ip = meta.get("peer_ip")
+            peer_port = meta.get("peer_port")
+            orig_dst_ip = meta.get("orig_dst_ip")
+            orig_dst_port = meta.get("orig_dst_port")
+
+            self.logger.info(
+                f"[IKEP] ARRIVE END={self.name} listen_port={ike_listen_port} len={len(plain)} "
+                f"peer={peer_ip}:{peer_port} orig_dst={orig_dst_ip}:{orig_dst_port} dir={direction}"
+            )
+
+            if peer_ip and peer_port:
+                local_dst = (orig_dst_ip, int(orig_dst_port)) if (orig_dst_ip and orig_dst_port) else None
+                self.ike_proxy.inject_to_charon(
+                    plain,
+                    ike_listen_port,
+                    peer_addr=(peer_ip, int(peer_port)),
+                    local_dst=local_dst,
+                )
+            else:
+                self.logger.warning("[IKEP] missing peer_ip/peer_port in meta; injecting without transparent src spoof")
+                self.ike_proxy.inject_to_charon(plain, ike_listen_port)
+            return
 
         route_fwd = [src_u, x1_u, x2_u, dst_u]
         route_back = [dst_u, x2_u, x1_u, src_u]
