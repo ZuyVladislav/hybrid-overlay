@@ -3,6 +3,7 @@ import socket
 import threading
 
 IKE_PORTS = (15000, 15001)
+CHARON_PORTS = {15000: 25000, 15001: 25001}  # map listen->charon
 
 class IkeProxy:
     """
@@ -30,6 +31,7 @@ class IkeProxy:
             self.on_local_packet(data, port)
 
     def inject_to_charon(self, data: bytes, port: int):
+        real_port = CHARON_PORTS.get(port, 25000)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.sendto(data, ("127.0.0.1", port))
-        self.logger.info(f"[IKEP] -> charon 127.0.0.1:{port} len={len(data)}")
+        s.sendto(data, ("127.0.0.1", real_port))
+        self.logger.info(f"[IKEP] -> charon 127.0.0.1:{real_port} len={len(data)}")
