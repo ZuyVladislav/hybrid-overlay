@@ -26,6 +26,7 @@ class Transport:
             self.logger.error(f"[BUG] attempt to send to self peer={peer} DROP")
             return
         ip, port = self.peer_addr(peer)
+        self.logger.info(f"[SEND] to={peer} addr={(ip, port)} len={len(payload)}")
         self.sock.sendto(payload, (ip, port))
 
     def peer_from_src(self, src: Tuple[str, int]) -> Optional[str]:

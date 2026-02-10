@@ -129,16 +129,31 @@ class NodeDaemon:
             return
 
         t = p.get("t")
-        claimed = p.get("from")
+        # claimed НЕ используем для логики, только для диагностики
+        claimed_from = p.get("from")
+        claimed_to = p.get("to")
+        sid = p.get("sid")
 
+        # LOCAL control-plane: accept from loopback
         if t == T_LOCAL_CONNECT:
             self.router.on_local_connect(p, src)
             return
 
+        # resolve peer (transport decides strict vs ip-only fallback)
         peer = self.transport.resolve_peer(t, p, src)
+
+        # ✅ ЛОГ №1: почему выкинули пакет
         if peer is None:
-            self.logger.warning(f"[ADDR] drop packet: src={src} claimed={claimed} t={t}")
+            self.logger.warning(
+                f"[ADDR] DROP t={t} src={src} from={claimed_from} to={claimed_to} sid={sid}"
+            )
             return
+
+        # ✅ ЛОГ №2: видим, что mailbox-ответ реально дошёл до демона
+        if t in (T_MGMT_INIT_RESP, T_MGMT_AUTH_RESP):
+            self.logger.info(
+                f"[MGMT] RX {t} src={src} peer={peer} from={claimed_from} to={claimed_to} sid={sid}"
+            )
 
         # mgmt responder
         if t == T_MGMT_INIT:
@@ -148,7 +163,7 @@ class NodeDaemon:
             self.mgmt.on_mgmt_auth(p, peer)
             return
 
-        # mgmt mailbox
+        # mgmt mailbox (initiator side)
         if t == T_MGMT_INIT_RESP:
             self.mgmt.on_init_resp(p)
             return
@@ -156,11 +171,12 @@ class NodeDaemon:
             self.mgmt.on_auth_resp(p)
             return
 
+        # plaintext error relay
         if t == T_ERROR:
             self.err.on_error(p, peer)
             return
 
-        # secure overlay messages
+        # secure overlay messages (STRICT peer only should have passed resolve_peer)
         if t in (T_I1, T_I2, T_OKX2, T_PROXY_BLOB):
             try:
                 plain = self.sec.link_decrypt(p)
@@ -178,7 +194,7 @@ class NodeDaemon:
                 self.proxy.handle_PROXY(peer, plain, p.get("meta") or {})
             return
 
-        self.logger.info(f"[DROP] unknown t={t} from={peer}")
+        self.logger.info(f"[DROP] unknown t={t} peer={peer} src={src}")
 
     def _preconnect_loop(self):
         time.sleep(random.uniform(0.2, 0.8))
