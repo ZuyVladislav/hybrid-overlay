@@ -577,7 +577,21 @@ class NodeDaemon:
             self.send_error_back(conn_id, req, peer, phase="I2", code="X2_IS_DST",
                                  msg="X2 equals destination (B). Drop connection and retry.")
             return
-
+        # ✅ Variant A: pre-establish X2<->DST (B) here (not in PROXY phase)
+        with self.lock:
+            has_dst_sess = dst in self.sessions
+        if not has_dst_sess:
+            if not self.ensure_session(dst, reason=f"X2->DST preconnect CONN={conn_id} REQ={req} via X1={peer}"):
+                self.logger.error(f"[I2] cannot preconnect to DST={dst} as X2. CONN={conn_id}")
+                self.send_error_back(
+                    conn_id=conn_id,
+                    src_u=req,
+                    x1_u=peer,
+                    phase="I2",
+                    code="NO_SESSION_DST",
+                    msg=f"X2 cannot ensure DST={dst} (preconnect failed)"
+                )
+                return
         ok = secrets.token_bytes(32) + secrets.token_bytes(16)
         header = f"CONN={conn_id}|REQ={req}|DST={dst}|X2={x2}".encode()
         payload = header + b"|OK=" + ok
@@ -675,10 +689,24 @@ class NodeDaemon:
             return
         nxt = route[nxt_idx]
 
-        # ✅ On-demand ensure session to next hop
+        # ✅ Variant A: never establish MGMT from PROXY phase to DST.
+        # Expect X2<->DST to be pre-established in handle_I2().
         with self.lock:
             has_session = nxt in self.sessions
+
         if not has_session:
+            if nxt == dst_u:
+                self.logger.error(
+                    f"[PROXY] NO_SESSION_DST (blocked establish in PROXY) "
+                    f"{self.name}->{nxt} phase={phase} CONN={conn_id}"
+                )
+                self.send_error_back(
+                    conn_id, src_u, x1_u, phase,
+                    code="NO_SESSION_DST",
+                    msg=f"no session to DST={nxt}; must be preconnected by X2"
+                )
+                return
+
             if not self.ensure_session(nxt, reason=f"PROXY {direction} phase={phase} CONN={conn_id}"):
                 self.logger.error(f"[PROXY] cannot ensure session to {nxt}")
                 self.send_error_back(conn_id, src_u, x1_u, phase, code="NO_SESSION_NEXT", msg=f"cannot ensure {nxt}")
