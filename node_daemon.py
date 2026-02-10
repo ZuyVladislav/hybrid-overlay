@@ -523,7 +523,7 @@ class NodeDaemon:
             return
 
         # ✅ X1 chooses X2 excluding {X1, REQ, DST}
-        cand_x2 = [u for u in USERS.keys() if u != self.name]
+        cand_x2 = [u for u in USERS if u not in (self.name, req, dst)]
         if not cand_x2:
             self.sock.sendto(err("NO_X2_CAND", "no X2 candidates"), src)
             return
@@ -773,7 +773,7 @@ class NodeDaemon:
             return
 
         # ✅ A picks X1
-        cand_x1 = [u for u in USERS.keys() if u != user]
+        cand_x1 = [u for u in USERS if u not in (user, dst)]
         if not cand_x1:
             self.sock.sendto(err("NO_X1_CAND", "no X1 candidates"), src)
             return
