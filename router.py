@@ -1,9 +1,9 @@
-# router.py
 from __future__ import annotations
 import random
 import secrets
 import threading
 import time
+import subprocess
 from typing import Dict, List, Tuple
 
 from config import USERS, UDP_TIMEOUT_S, I3_LEN
@@ -34,6 +34,98 @@ class Router:
                 k, v = part.split("=", 1)
                 out[k.strip()] = v.strip()
         return out
+
+    # --- helper: try install CHILD_SA into kernel ---
+    def _try_install_child_sa_from_state(self, st: ConnState) -> bool:
+        """
+        Попытаться найти параметры CHILD_SA в st/self.state и установить xfrm через /usr/local/bin/install_sa.sh.
+        Возвращает True если вызов был произведён и завершился успешно, иначе False.
+        """
+        candidates = [
+            getattr(st, 'child_spi_out', None),
+            getattr(st, 'spi_out', None),
+            getattr(st, 'child', None),
+            getattr(self.state, 'child_sas', None),
+        ]
+
+        def extract_from(obj):
+            if obj is None:
+                return None
+            if isinstance(obj, dict):
+                spi = obj.get('spi_out') or obj.get('spi') or obj.get('spi_out_hex')
+                sk_e = obj.get('sk_e') or obj.get('sk_enc') or obj.get('enc_key')
+                sk_a = obj.get('sk_a') or obj.get('sk_auth') or obj.get('auth_key')
+                enc = obj.get('enc') or obj.get('enc_alg') or obj.get('encryption')
+                src = obj.get('src') or obj.get('src_ip') or None
+                dst = obj.get('dst') or obj.get('dst_ip') or None
+                return spi, sk_e, sk_a, enc, src, dst
+            return None
+
+        # Try direct attributes on st
+        try:
+            spi = getattr(st, 'spi_out', None) or getattr(st, 'child_spi_out', None)
+            sk_e = getattr(st, 'sk_e', None) or getattr(st, 'child_sk_e', None)
+            sk_a = getattr(st, 'sk_a', None) or getattr(st, 'child_sk_a', None)
+            enc = getattr(st, 'enc_alg', None) or getattr(st, 'child_enc', None)
+            src_ip = getattr(st, 'src_ip', None) or getattr(st, 'src', None)
+            dst_ip = getattr(st, 'dst_ip', None) or getattr(st, 'dst', None)
+
+            found = None
+            if spi and sk_e and sk_a:
+                found = (spi, sk_e, sk_a, enc, src_ip, dst_ip)
+            else:
+                for c in candidates:
+                    if isinstance(c, dict):
+                        res = extract_from(c)
+                        if res and res[0] and res[1] and res[2]:
+                            found = res
+                            break
+        except Exception as e:
+            self.logger.exception("Failed to probe state for CHILD_SA params: %s", e)
+            found = None
+
+        if not found:
+            self.logger.warning(f"[CONN {st.conn_id}] CHILD_SA params not found (cannot install kernel SA)")
+            return False
+
+        spi, sk_e, sk_a, enc, src_ip, dst_ip = found
+
+        # normalize spi hex (remove 0x if present)
+        if isinstance(spi, str) and spi.startswith('0x'):
+            spi_hex = spi[2:]
+        else:
+            spi_hex = spi if isinstance(spi, str) else None
+
+        def tohex(v):
+            if v is None:
+                return None
+            if isinstance(v, bytes):
+                return v.hex()
+            s = str(v)
+            return s[2:] if s.startswith('0x') else s
+
+        enc_key_hex = tohex(sk_e)
+        auth_key_hex = tohex(sk_a)
+        enc_alg = enc or 'aes256'
+
+        if not (spi_hex and enc_key_hex and auth_key_hex and src_ip and dst_ip):
+            self.logger.warning(
+                f"[CONN {st.conn_id}] incomplete CHILD params: spi={spi_hex}, "
+                f"enc={enc_key_hex is not None}, auth={auth_key_hex is not None}, src={src_ip}, dst={dst_ip}"
+            )
+            return False
+
+        cmd = ["/usr/local/bin/install_sa.sh", src_ip, dst_ip, spi_hex, enc_key_hex, auth_key_hex, enc_alg]
+        self.logger.info(f"[CONN {st.conn_id}] calling install_sa")
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=20, text=True)
+            self.logger.info(f"[CONN {st.conn_id}] install_sa: {out.strip()}")
+            return True
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"[CONN {st.conn_id}] install_sa failed (rc=%s): %s", e.returncode, e.output)
+        except Exception as e:
+            self.logger.exception(f"[CONN {st.conn_id}] install_sa exception: {e}")
+        return False
 
     # -------- LOCAL_CONNECT --------
     def on_local_connect(self, p: dict, src: Tuple[str, int]):
@@ -186,6 +278,18 @@ class Router:
                 continue
 
             self.logger.info(f"[CONN {st.conn_id}] SUCCESS: proxied INIT/AUTH; далее прямой ESP (вне overlay)")
+
+            # --- попытка установить CHILD_SA в kernel (если параметры доступны) ---
+            try:
+                ok_install = self._try_install_child_sa_from_state(st)
+                if ok_install:
+                    self.logger.info(f"[CONN {st.conn_id}] CHILD_SA installed into kernel (attempted)")
+                else:
+                    self.logger.info(f"[CONN {st.conn_id}] CHILD_SA not installed (no params available)")
+            except Exception as e:
+                self.logger.exception("Install attempt failed: %s", e)
+            # --- конец попытки ---
+
             return
 
         self.logger.error(f"[CONN {st.conn_id}] give up (retries exhausted)")
