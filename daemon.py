@@ -5,6 +5,7 @@ import random
 import socket
 import threading
 import time
+import hashlib
 
 from concurrent.futures import ThreadPoolExecutor
 from config import USERS, PRECONNECT_ENABLED
@@ -211,6 +212,19 @@ class NodeDaemon:
 
             elif t == T_PROXY_BLOB:
                 meta = p.get("meta") or {}
+
+                # --- PROXY_BLOB debug: fingerprint decrypted payload and show meta ---
+                try:
+                    sha = hashlib.sha256(plain).hexdigest()
+                    head = plain[:64].hex() if len(plain) else ""
+                    self.logger.debug(
+                        f"[PROXY_BLOB] meta={meta} phase={meta.get('phase')} "
+                        f"dir={meta.get('dir')} conn={meta.get('conn_id') or meta.get('conn')} "
+                        f"len={len(plain)} sha256={sha} head={head}"
+                    )
+                except Exception:
+                    self.logger.exception("[PROXY_BLOB] debug log failed")
+
                 self.logger.info(
                     f"[PROXY] RX peer={peer} len={len(plain)} "
                     f"meta.dir={meta.get('dir')} meta.idx={meta.get('idx')} "
