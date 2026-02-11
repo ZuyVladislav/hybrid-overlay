@@ -1,3 +1,4 @@
+# crypto_util.py
 # -*- coding: utf-8 -*-
 
 import secrets
@@ -9,7 +10,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.backends import default_backend
+
 
 def hkdf_sha256(ikm: bytes, salt: bytes, info: bytes, length: int = 32) -> bytes:
     return HKDF(
@@ -17,7 +18,6 @@ def hkdf_sha256(ikm: bytes, salt: bytes, info: bytes, length: int = 32) -> bytes
         length=length,
         salt=salt,
         info=info,
-        backend=default_backend(),
     ).derive(ikm)
 
 
@@ -31,10 +31,6 @@ def aesgcm_encrypt(key32: bytes, plaintext: bytes, aad: bytes) -> Tuple[bytes, b
 def aesgcm_decrypt(key32: bytes, nonce: bytes, ciphertext: bytes, aad: bytes) -> bytes:
     aes = AESGCM(key32)
     return aes.decrypt(nonce, ciphertext, aad)
-
-
-def xpub_bytes(pub: x25519.X25519PublicKey) -> bytes:
-    return pub.public_bytes_raw()
 
 
 def xpub_bytes(pub: x25519.X25519PublicKey) -> bytes:

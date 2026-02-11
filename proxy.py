@@ -25,7 +25,7 @@ class Proxy:
         )
 
         phase = meta.get("phase")
-        direction = meta.get("dir")
+        direction = meta.get("dir", "fwd")
         src_u = meta.get("src")
         dst_u = meta.get("dst")
 
@@ -35,7 +35,7 @@ class Proxy:
         orig_dst_ip = meta.get("orig_dst_ip")
         orig_dst_port = int(meta.get("orig_dst_port") or 500)
 
-        # 1) ФИНАЛ на forward: я = DST → inject в charon и выходим
+        # 1) ФИНАЛ на forward: я = DST → inject в charon и выходим (IKE_REAL)
         if phase == "IKE_REAL" and direction == "fwd" and self.name == dst_u:
             self.logger.info(
                 f"[IKEP] ARRIVE END={self.name} len={len(data)} peer={peer_ip}:{peer_port} "
@@ -55,7 +55,7 @@ class Proxy:
                 self.logger.exception(f"[IKEP] inject_to_charon failed on DST={self.name}: {e}")
             return
 
-        # 2) ФИНАЛ на back: я = SRC → inject в charon и выходим
+        # 2) ФИНАЛ на back: я = SRC → inject в charon и выходим (IKE_REAL back)
         if phase == "IKE_REAL" and direction == "back" and self.name == src_u:
             self.logger.info(
                 f"[IKEP] ARRIVE SRC={self.name} len={len(data)} peer={peer_ip}:{peer_port} "
@@ -75,28 +75,19 @@ class Proxy:
                 self.logger.exception(f"[IKEP] inject_to_charon failed on SRC={self.name}: {e}")
             return
 
-        # 3) ИНАЧЕ — обычный forward по маршруту (как у тебя было)
-        self.forward_proxy(data, meta)
-
-        route_fwd = [src_u, x1_u, x2_u, dst_u]
-        route_back = [dst_u, x2_u, x1_u, src_u]
-        route = route_fwd if direction == "fwd" else route_back
-
-        if idx < 0 or idx >= len(route) or route[idx] != self.name:
-            self.logger.warning(f"[PROXY] route mismatch idx={idx} dir={direction} route={route}")
-            return
-
-        if direction == "fwd" and self.name == dst_u and idx == 3:
-            self.logger.info(f"[PROXY] ARRIVE DST={self.name} phase={phase} len={len(plain)} CONN={conn_id}")
-            meta2 = dict(meta); meta2["dir"] = "back"; meta2["idx"] = 0
-            self.forward_proxy(plain, meta2)
-            return
-
-        self.forward_proxy(plain, meta)
+        # 3) ИНАЧЕ — обычный forward по маршруту
+        try:
+            self.forward_proxy(data, meta)
+        except Exception as e:
+            self.logger.exception(f"[PROXY] forward_proxy raised: {e}; meta={meta}")
+        return
 
     def forward_proxy(self, payload: bytes, meta: dict):
-        src_u = meta["src"]; dst_u = meta["dst"]; x1_u = meta["x1"]; x2_u = meta["x2"]
-        idx = int(meta["idx"])
+        src_u = meta.get("src"); dst_u = meta.get("dst"); x1_u = meta.get("x1"); x2_u = meta.get("x2")
+        try:
+            idx = int(meta.get("idx", 0))
+        except Exception:
+            idx = 0
         direction = meta.get("dir", "fwd")
         phase = meta.get("phase", "UNK")
         conn_id = meta.get("conn_id", "")
@@ -105,8 +96,43 @@ class Proxy:
         route_back = [dst_u, x2_u, x1_u, src_u]
         route = route_fwd if direction == "fwd" else route_back
 
+        # Basic sanity
+        if idx < 0 or idx >= len(route):
+            self.logger.warning(f"[PROXY] route mismatch idx={idx} dir={direction} route={route} meta={meta}")
+            return
+
+        # If we are at final hop in forward direction -> special behavior
+        if direction == "fwd" and idx == len(route) - 1:
+            # Arrived at DST
+            self.logger.info(f"[PROXY] ARRIVE DST={self.name} phase={phase} len={len(payload)} CONN={conn_id}")
+            # For IKE_REAL we already handled injection in handle_PROXY; but keep safety here
+            if phase == "IKE_REAL":
+                self.logger.info(f"[PROXY] (safety) IKE_REAL inject to charon on DST={self.name}")
+                # Can't inject if no peer_ip/orig_dst info: just log
+                return
+            # Otherwise, start back-route: send payload back along overlay with dir=back idx=0
+            meta2 = dict(meta)
+            meta2["dir"] = "back"
+            meta2["idx"] = 0
+            back_route = route_back
+            if len(back_route) < 2:
+                self.logger.error(f"[PROXY] back route invalid for DST arrival: {back_route}")
+                return
+            nxt = back_route[1]
+            try:
+                self.sec.link_send(nxt, T_PROXY_BLOB, payload, meta=meta2)
+                self.logger.info(
+                    f"[PROXY] start BACK {self.name}->{nxt} idx=0 phase={phase} "
+                    f"route={src_u}->{x1_u}->{x2_u}->{dst_u} CONN={conn_id}"
+                )
+            except Exception as e:
+                self.logger.exception(f"[PROXY] failed starting back from DST to {nxt}: {e}")
+            return
+
+        # Normal forwarding to next hop
         nxt_idx = idx + 1
         if nxt_idx >= len(route):
+            # nothing to send
             return
         nxt = route[nxt_idx]
 
@@ -134,8 +160,13 @@ class Proxy:
             self.logger.error(f"[PROXY] BUG: next hop is self, drop. meta={meta}")
             return
 
-        self.sec.link_send(nxt, T_PROXY_BLOB, payload, meta=meta2)
-        self.logger.info(
-            f"[PROXY] {direction} {self.name}->{nxt} idx={nxt_idx} phase={phase} "
-            f"route={src_u}->{x1_u}->{x2_u}->{dst_u} CONN={conn_id}"
-        )
+        try:
+            self.sec.link_send(nxt, T_PROXY_BLOB, payload, meta=meta2)
+            self.logger.info(
+                f"[PROXY] {direction} {self.name}->{nxt} idx={nxt_idx} phase={phase} "
+                f"route={src_u}->{x1_u}->{x2_u}->{dst_u} CONN={conn_id}"
+            )
+        except Exception as e:
+            self.logger.exception(f"[PROXY] link_send failed {self.name}->{nxt} idx={nxt_idx} phase={phase} CONN={conn_id}: {e}")
+            self.err.send_error_back(conn_id, src_u, x1_u, phase, code="LINK_SEND_FAIL", msg=f"link_send to {nxt} failed")
+            return

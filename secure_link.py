@@ -27,6 +27,12 @@ class SecureLink:
         aad = f"{mtype}:{self.name}->{peer}:{sess.sid}".encode()
         nonce, ct = aesgcm_encrypt(sess.key, payload, aad=aad)
 
+        # --- added logging for debugging MTU/length issues ---
+        try:
+            self.logger.debug(f"[SEC] link_send to={peer} sid={sess.sid} nonce_len={len(nonce)} ct_len={len(ct)} meta={meta}")
+        except Exception:
+            pass
+
         msg = {
             "t": mtype, "sid": sess.sid,
             "from": self.name, "to": peer,
@@ -41,6 +47,14 @@ class SecureLink:
             sess = self.state.sessions.get(peer)
         if not sess:
             raise RuntimeError(f"No session from {peer}")
+
+        # debug
+        try:
+            nhex = msg.get("nonce", "")
+            chex = msg.get("ct", "")
+            self.logger.debug(f"[SEC] link_decrypt from={peer} sid={sess.sid} nonce_len={len(nhex)//2} ct_len={len(chex)//2}")
+        except Exception:
+            pass
 
         aad = f"{msg['t']}:{peer}->{self.name}:{sess.sid}".encode()
         return aesgcm_decrypt(
