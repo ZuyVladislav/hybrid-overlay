@@ -17,40 +17,64 @@ class Proxy:
         self.ike_proxy = ike_proxy
         self.logger = logger
 
-    def handle_PROXY(self, peer: str, plain: bytes, meta: dict):
-        conn_id = meta.get("conn_id", "")
-        src_u = meta.get("src", "")
-        dst_u = meta.get("dst", "")
-        x1_u = meta.get("x1", "")
-        x2_u = meta.get("x2", "")
-        idx = int(meta.get("idx", 0))
-        direction = meta.get("dir", "fwd")
-        phase = meta.get("phase", "UNK")
+    def handle_PROXY(self, peer: str, data: bytes, meta: dict):
+        # 0) trace входа
+        self.logger.info(
+            f"[PROXY] RX peer={peer} len={len(data)} dir={meta.get('dir')} idx={meta.get('idx')} "
+            f"src={meta.get('src')} dst={meta.get('dst')} x1={meta.get('x1')} x2={meta.get('x2')}"
+        )
 
-        if phase == "IKE_REAL" and idx == 3 and (self.name == dst_u or self.name == src_u):
-            ike_listen_port = int(meta.get("ike_port", 15000))
-            peer_ip = meta.get("peer_ip")
-            peer_port = meta.get("peer_port")
-            orig_dst_ip = meta.get("orig_dst_ip")
-            orig_dst_port = meta.get("orig_dst_port")
+        phase = meta.get("phase")
+        direction = meta.get("dir")
+        src_u = meta.get("src")
+        dst_u = meta.get("dst")
 
+        # --- IKE transparent metadata ---
+        peer_ip = meta.get("peer_ip")
+        peer_port = int(meta.get("peer_port") or 500)
+        orig_dst_ip = meta.get("orig_dst_ip")
+        orig_dst_port = int(meta.get("orig_dst_port") or 500)
+
+        # 1) ФИНАЛ на forward: я = DST → inject в charon и выходим
+        if phase == "IKE_REAL" and direction == "fwd" and self.name == dst_u:
             self.logger.info(
-                f"[IKEP] ARRIVE END={self.name} listen_port={ike_listen_port} len={len(plain)} "
-                f"peer={peer_ip}:{peer_port} orig_dst={orig_dst_ip}:{orig_dst_port} dir={direction}"
+                f"[IKEP] ARRIVE END={self.name} len={len(data)} peer={peer_ip}:{peer_port} "
+                f"orig_dst={orig_dst_ip}:{orig_dst_port}"
             )
-
-            if peer_ip and peer_port:
-                local_dst = (orig_dst_ip, int(orig_dst_port)) if (orig_dst_ip and orig_dst_port) else None
+            try:
                 self.ike_proxy.inject_to_charon(
-                    plain,
-                    ike_listen_port,
-                    peer_addr=(peer_ip, int(peer_port)),
-                    local_dst=local_dst,
+                    data=data,
+                    peer_addr=(peer_ip, peer_port),
+                    local_dst=(orig_dst_ip, orig_dst_port),
                 )
-            else:
-                self.logger.warning("[IKEP] missing peer_ip/peer_port in meta; injecting without transparent src spoof")
-                self.ike_proxy.inject_to_charon(plain, ike_listen_port)
+                self.logger.info(
+                    f"[IKEP] -> charon inject src={peer_ip}:{peer_port} dst={orig_dst_ip}:{orig_dst_port}"
+                )
+            except Exception as e:
+                self.logger.exception(f"[IKEP] inject_to_charon failed on DST={self.name}: {e}")
             return
+
+        # 2) ФИНАЛ на back: я = SRC → inject в charon и выходим
+        if phase == "IKE_REAL" and direction == "back" and self.name == src_u:
+            self.logger.info(
+                f"[IKEP] ARRIVE SRC={self.name} len={len(data)} peer={peer_ip}:{peer_port} "
+                f"orig_dst={orig_dst_ip}:{orig_dst_port}"
+            )
+            try:
+                self.ike_proxy.inject_to_charon(
+                    data=data,
+                    peer_addr=(peer_ip, peer_port),
+                    local_dst=(orig_dst_ip, orig_dst_port),
+                )
+                self.logger.info(
+                    f"[IKEP] -> charon inject src={peer_ip}:{peer_port} dst={orig_dst_ip}:{orig_dst_port}"
+                )
+            except Exception as e:
+                self.logger.exception(f"[IKEP] inject_to_charon failed on SRC={self.name}: {e}")
+            return
+
+        # 3) ИНАЧЕ — обычный forward по маршруту (как у тебя было)
+        self.forward_proxy(data, meta)
 
         route_fwd = [src_u, x1_u, x2_u, dst_u]
         route_back = [dst_u, x2_u, x1_u, src_u]

@@ -202,8 +202,15 @@ class NodeDaemon:
                 self.exec.submit(self.router.handle_I2, peer, plain)
             elif t == T_OKX2:
                 self.exec.submit(self.router.handle_OKX2, peer, plain)
-            elif t == T_PROXY_BLOB:
-                self.exec.submit(self.proxy.handle_PROXY, peer, plain, p.get("meta") or {})
+                elif t == T_PROXY_BLOB:
+                meta = p.get("meta") or {}
+                self.logger.info(
+                    f"[PROXY] RX peer={peer} len={len(plain)} "
+                    f"meta.dir={meta.get('dir')} meta.idx={meta.get('idx')} "
+                    f"src={meta.get('src')} dst={meta.get('dst')} "
+                    f"x1={meta.get('x1')} x2={meta.get('x2')}"
+                )
+                self.exec.submit(self.proxy.handle_PROXY, peer, plain, meta)
             return
 
         self.logger.info(f"[DROP] unknown t={t} peer={peer} src={src}")
