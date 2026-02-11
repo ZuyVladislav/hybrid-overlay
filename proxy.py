@@ -43,6 +43,7 @@ class Proxy:
             )
             try:
                 self.ike_proxy.inject_to_charon(
+                    listen_port=15000,
                     data=data,
                     peer_addr=(peer_ip, peer_port),
                     local_dst=(orig_dst_ip, orig_dst_port),
@@ -63,9 +64,9 @@ class Proxy:
             try:
                 self.ike_proxy.inject_to_charon(
                     data=data,
+                    listen_port=15000,
                     peer_addr=(peer_ip, peer_port),
                     local_dst=(orig_dst_ip, orig_dst_port),
-                    listen_port=15000,
                 )
                 self.logger.info(
                     f"[IKEP] -> charon inject src={peer_ip}:{peer_port} dst={orig_dst_ip}:{orig_dst_port}"
