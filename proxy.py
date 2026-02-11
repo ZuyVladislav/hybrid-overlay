@@ -1,147 +1,201 @@
 # proxy.py
 from __future__ import annotations
-from typing import Optional
+import time
+import threading
+from typing import Optional, Dict, Any
 
 from protocol import T_PROXY_BLOB
 
-from state import DaemonState
-
-
+# Proxy — отвечает за пересылку T_PROXY_BLOB по цепочке узлов.
 class Proxy:
-    def __init__(self, name: str, state: DaemonState, mgmt, secure_link, error_relay, ike_proxy, logger):
+    def __init__(self, name: str, state, mgmt, secure_link, error_relay, ike_proxy, logger):
         self.name = name
         self.state = state
         self.mgmt = mgmt
         self.sec = secure_link
-        self.err = error_relay
+        self.error_relay = error_relay
         self.ike_proxy = ike_proxy
         self.logger = logger
+        self._lock = threading.Lock()
 
-    def handle_PROXY(self, peer: str, data: bytes, meta: dict):
-        # 0) trace входа
-        self.logger.info(
-            f"[PROXY] RX peer={peer} len={len(data)} dir={meta.get('dir')} idx={meta.get('idx')} "
-            f"src={meta.get('src')} dst={meta.get('dst')} x1={meta.get('x1')} x2={meta.get('x2')}"
-        )
+    def _determine_next_hop(self, meta: Dict[str, Any]) -> Optional[str]:
+        """Определить следующий hop по meta и self.name.
 
-        phase = meta.get("phase")
-        direction = meta.get("dir", "fwd")
-        src_u = meta.get("src")
-        dst_u = meta.get("dst")
+        Ожидаемые поля meta: src, dst, x1, x2, dir (fwd|back), idx (опционально).
+        Правила:
+          fwd: src -> x1 -> x2 -> dst
+          back: dst -> x2 -> x1 -> src
+        """
+        src = meta.get("src")
+        dst = meta.get("dst")
+        x1 = meta.get("x1")
+        x2 = meta.get("x2")
+        dir_ = meta.get("dir")
 
-        # --- IKE transparent metadata ---
-        peer_ip = meta.get("peer_ip")
-        peer_port = int(meta.get("peer_port") or 500)
-        orig_dst_ip = meta.get("orig_dst_ip")
-        orig_dst_port = int(meta.get("orig_dst_port") or 500)
+        if not all([src, dst, x1, x2, dir_]):
+            self.logger.error(f"[PROXY] bad meta (missing fields): {meta}")
+            return None
 
-        # 1) ФИНАЛ на forward: я = DST → inject в charon и выходим (IKE_REAL)
-        if phase == "IKE_REAL" and direction == "fwd" and self.name == dst_u:
-            self.logger.info(
-                f"[IKEP] ARRIVE END={self.name} len={len(data)} peer={peer_ip}:{peer_port} "
-                f"orig_dst={orig_dst_ip}:{orig_dst_port}"
-            )
-            try:
-                self.ike_proxy.inject_to_charon(
-                    listen_port=15000,
-                    data=data,
-                    peer_addr=(peer_ip, peer_port),
-                    local_dst=(orig_dst_ip, orig_dst_port),
-                )
-                self.logger.info(
-                    f"[IKEP] -> charon inject src={peer_ip}:{peer_port} dst={orig_dst_ip}:{orig_dst_port}"
-                )
-            except Exception as e:
-                self.logger.exception(f"[IKEP] inject_to_charon failed on DST={self.name}: {e}")
-            return
+        cur = self.name
 
-        # 2) ФИНАЛ на back: я = SRC → inject в charon и выходим (IKE_REAL back)
-        if phase == "IKE_REAL" and direction == "back" and self.name == src_u:
-            self.logger.info(
-                f"[IKEP] ARRIVE SRC={self.name} len={len(data)} peer={peer_ip}:{peer_port} "
-                f"orig_dst={orig_dst_ip}:{orig_dst_port}"
-            )
-            try:
-                self.ike_proxy.inject_to_charon(
-                    data=data,
-                    listen_port=15000,
-                    peer_addr=(peer_ip, peer_port),
-                    local_dst=(orig_dst_ip, orig_dst_port),
-                )
-                self.logger.info(
-                    f"[IKEP] -> charon inject src={peer_ip}:{peer_port} dst={orig_dst_ip}:{orig_dst_port}"
-                )
-            except Exception as e:
-                self.logger.exception(f"[IKEP] inject_to_charon failed on SRC={self.name}: {e}")
-            return
+        if dir_ == "fwd":
+            if cur == src:
+                return x1
+            if cur == x1:
+                return x2
+            if cur == x2:
+                return dst
+            # not in route
+            self.logger.error(f"[PROXY] fwd: {cur} not in {src}->{x1}->{x2}->{dst}")
+            return None
 
-        # 3) ИНАЧЕ — обычный forward по маршруту
+        if dir_ == "back":
+            if cur == dst:
+                return x2
+            if cur == x2:
+                return x1
+            if cur == x1:
+                return src
+            self.logger.error(f"[PROXY] back: {cur} not in {src}->{x1}->{x2}->{dst}")
+            return None
+
+        self.logger.error(f"[PROXY] unknown dir: {dir_} in meta={meta}")
+        return None
+
+    def _send_error_back(self, conn_id: Optional[str], src: Optional[str],
+                         x1: Optional[str], phase: Optional[str],
+                         code: str, msg: str, prev_peer: Optional[str]):
+        """Попытка корректно уведомить об ошибке:
+           - если есть conn_id и error_relay.send_error_back -> использовать его
+           - иначе — собрать пакет и либо отправить через error_relay.on_error, либо залогировать
+        """
         try:
-            self.forward_proxy(data, meta)
+            if conn_id and hasattr(self.error_relay, "send_error_back"):
+                try:
+                    self.error_relay.send_error_back(conn_id, src or "", x1 or "", phase or "", code, msg)
+                    self.logger.info(f"[PROXY] error sent back via error_relay.send_error_back conn={conn_id} code={code}")
+                    return
+                except Exception as e:
+                    self.logger.exception(f"[PROXY] send_error_back raised: {e}")
+
+            # fallback: если есть on_error, передадим туда сформированный p
+            if hasattr(self.error_relay, "on_error"):
+                p = {
+                    "code": code,
+                    "msg": msg,
+                    "meta": {
+                        "conn_id": conn_id or "",
+                        "src": src or "",
+                        "x1": x1 or "",
+                        "phase": phase or "",
+                        # строим минимальную маршрутную информацию, idx=1 чтобы error_relay мог двигать дальше
+                        "idx": 1,
+                        "route": [self.name, x1 or "", src or ""]
+                    }
+                }
+                try:
+                    # on_error принимает (p, peer)
+                    self.error_relay.on_error(p, prev_peer)
+                    self.logger.info(f"[PROXY] error handed to error_relay.on_error (peer={prev_peer})")
+                    return
+                except Exception as e:
+                    self.logger.exception(f"[PROXY] error_relay.on_error raised: {e}")
+
+            # last resort: просто логируем
+            self.logger.error(f"[PROXY] cannot relay error (no suitable method). code={code} msg={msg} conn={conn_id}")
+
         except Exception as e:
-            self.logger.exception(f"[PROXY] forward_proxy raised: {e}; meta={meta}")
-        return
+            self.logger.exception(f"[PROXY] _send_error_back exception: {e}")
 
-    def forward_proxy(self, payload: bytes, meta: dict):
-        src_u = meta.get("src"); dst_u = meta.get("dst"); x1_u = meta.get("x1"); x2_u = meta.get("x2")
+    def handle_PROXY(self, peer: str, plain: bytes, meta: Dict[str, Any]):
+        """
+        Обработка T_PROXY_BLOB.
+        peer - имя узла-отправителя (overlay peer name).
+        plain - расшифрованный blob (байты).
+        meta - метаинформация маршрута.
+        """
         try:
-            idx = int(meta.get("idx", 0))
-        except Exception:
-            idx = 0
-        direction = meta.get("dir", "fwd")
-        phase = meta.get("phase", "UNK")
-        conn_id = meta.get("conn_id", "")
+            src = meta.get("src")
+            dst = meta.get("dst")
+            x1 = meta.get("x1")
+            x2 = meta.get("x2")
+            dir_ = meta.get("dir")
+            idx = meta.get("idx", 0)
+            phase = meta.get("phase")
+            conn_id = meta.get("conn_id")
 
-        route_fwd = [src_u, x1_u, x2_u, dst_u]
-        route_back = [dst_u, x2_u, x1_u, src_u]
-        route = route_fwd if direction == "fwd" else route_back
+            self.logger.info(
+                f"[PROXY] RX peer={peer} len={len(plain)} meta.dir={dir_} meta.idx={idx} "
+                f"src={src} dst={dst} x1={x1} x2={x2} phase={phase} conn={conn_id}"
+            )
 
-        # Basic sanity
-        if idx < 0 or idx >= len(route):
-            self.logger.warning(f"[PROXY] route mismatch idx={idx} dir={direction} route={route} meta={meta}")
-            return
-
-        # Compute next hop
-        nxt_idx = idx + 1
-        if nxt_idx >= len(route):
-            # nothing to send
-            return
-        nxt = route[nxt_idx]
-
-        # If next hop resolves to self -> bug/loop — drop safely before ensure_session
-        if nxt == self.name:
-            self.logger.error(f"[PROXY] BUG: next hop is self (nxt_idx={nxt_idx}) — drop to avoid ensure_session(self). meta={meta}")
-            return
-
-        # Ensure we have a session to next hop (create if needed)
-        with self.state.lock:
-            has_session = nxt in self.state.sessions
-
-        if not has_session:
-            # Variant A: never establish session to DST during PROXY
-            if nxt == dst_u:
-                self.logger.error(f"[PROXY] NO_SESSION_DST (blocked in PROXY) {self.name}->{nxt} phase={phase} CONN={conn_id}")
-                self.err.send_error_back(
-                    conn_id, src_u, x1_u, phase,
-                    code="NO_SESSION_DST",
-                    msg=f"no session to DST={nxt}; must be preconnected by X2"
-                )
+            next_peer = self._determine_next_hop(meta)
+            if not next_peer:
+                msg = f"cannot determine next hop for meta={meta}"
+                self.logger.error(f"[PROXY] {msg}")
+                # уведомляем назад (prev peer)
+                self._send_error_back(conn_id, src, x1, phase, "NO_ROUTE", msg, prev_peer=peer)
                 return
 
-            if not self.mgmt.ensure_session(nxt, reason=f"PROXY {direction} phase={phase} CONN={conn_id}"):
-                self.logger.error(f"[PROXY] cannot ensure session to {nxt}")
-                self.err.send_error_back(conn_id, src_u, x1_u, phase, code="NO_SESSION_NEXT", msg=f"cannot ensure {nxt}")
+            # Защита от маршрута, в котором next_peer == self
+            if next_peer == self.name:
+                msg = f"invalid routing, next_peer == self ({self.name}) meta={meta}"
+                self.logger.error(f"[PROXY] {msg}")
+                self._send_error_back(conn_id, src, x1, phase, "NO_SESSION_NEXT", f"cannot ensure {self.name}", prev_peer=peer)
                 return
 
-        meta2 = dict(meta); meta2["idx"] = nxt_idx
+            # Попытка обеспечить session к next_peer
+            try:
+                self.logger.debug(f"[PROXY] ensure_session to {next_peer} (reason=PROXY {dir_})")
+                # Поддерживаем возможные варианты сигнатуры ensure_session
+                try:
+                    self.mgmt.ensure_session(next_peer, reason=f"PROXY {dir_}")
+                except TypeError:
+                    self.mgmt.ensure_session(next_peer)
+            except Exception as e:
+                self.logger.exception(f"[PROXY] mgmt.ensure_session({next_peer}) failed: {e}")
 
-        try:
-            self.sec.link_send(nxt, T_PROXY_BLOB, payload, meta=meta2)
-            self.logger.info(
-                f"[PROXY] {direction} {self.name}->{nxt} idx={nxt_idx} phase={phase} "
-                f"route={src_u}->{x1_u}->{x2_u}->{dst_u} CONN={conn_id}"
-            )
+            # Небольшое ожидание с проверкой state.sessions
+            session_ready = False
+            wait_total = 0.0
+            wait_step = 0.05
+            max_wait = 0.6
+            while wait_total < max_wait:
+                with self.state.lock:
+                    if next_peer in self.state.sessions:
+                        session_ready = True
+                        break
+                time.sleep(wait_step)
+                wait_total += wait_step
+
+            if not session_ready:
+                self.logger.warning(f"[PROXY] session to {next_peer} not ready after {max_wait:.2f}s; will attempt send anyway")
+
+            # Подготовка meta для следующего хопа: инкремент idx (в большинстве логики idx указывает позицию)
+            meta2 = dict(meta)
+            try:
+                meta2["idx"] = int(idx) + 1
+            except Exception:
+                meta2["idx"] = idx
+
+            # Отправляем дальше
+            try:
+                self.sec.link_send(next_peer, T_PROXY_BLOB, plain, meta=meta2)
+                self.logger.info(f"[PROXY] fwd {self.name}->{next_peer} dir={dir_} idx={meta2.get('idx')} phase={phase} conn={conn_id}")
+            except Exception as e:
+                self.logger.exception(f"[PROXY] link_send to {next_peer} failed: {e}")
+                # уведомляем предыдущий узел об ошибке отправки
+                self._send_error_back(conn_id, src, x1, phase, "SEND_FAIL", f"send to {next_peer} failed: {e}", prev_peer=peer)
+                return
+
         except Exception as e:
-            self.logger.exception(f"[PROXY] link_send failed {self.name}->{nxt} idx={nxt_idx} phase={phase} CONN={conn_id}: {e}")
-            self.err.send_error_back(conn_id, src_u, x1_u, phase, code="LINK_SEND_FAIL", msg=f"link_send to {nxt} failed")
-            return
+            # Защита от падения worker'а
+            self.logger.exception(f"[PROXY] handle_PROXY unexpected exception: {e}")
+            try:
+                self._send_error_back(meta.get("conn_id") if isinstance(meta, dict) else None,
+                                      meta.get("src") if isinstance(meta, dict) else None,
+                                      meta.get("x1") if isinstance(meta, dict) else None,
+                                      meta.get("phase") if isinstance(meta, dict) else None,
+                                      "INTERNAL_ERROR", f"proxy exception: {e}", prev_peer=peer)
+            except Exception:
+                pass
