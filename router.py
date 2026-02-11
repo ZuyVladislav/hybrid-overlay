@@ -1,3 +1,5 @@
+# router.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 import random
 import secrets
@@ -41,6 +43,17 @@ class Router:
         Попытаться найти параметры CHILD_SA в st/self.state и установить xfrm через /usr/local/bin/install_sa.sh.
         Возвращает True если вызов был произведён и завершился успешно, иначе False.
         """
+
+        # DEBUG: dump probe context
+        try:
+            self.logger.debug(f"[CONN {st.conn_id}] probe state attrs: st_keys={list(st.__dict__.keys())}")
+        except Exception:
+            pass
+        try:
+            self.logger.debug(f"[CONN {st.conn_id}] state child_sas={getattr(self.state, 'child_sas', None)}")
+        except Exception:
+            pass
+
         candidates = [
             getattr(st, 'child_spi_out', None),
             getattr(st, 'spi_out', None),
@@ -73,12 +86,14 @@ class Router:
             found = None
             if spi and sk_e and sk_a:
                 found = (spi, sk_e, sk_a, enc, src_ip, dst_ip)
+                self.logger.debug(f"[CONN {st.conn_id}] FOUND CHILD params direct: spi={spi} enc_key={'yes' if sk_e else 'no'} auth_key={'yes' if sk_a else 'no'} enc_alg={enc} src={src_ip} dst={dst_ip}")
             else:
                 for c in candidates:
                     if isinstance(c, dict):
                         res = extract_from(c)
                         if res and res[0] and res[1] and res[2]:
                             found = res
+                            self.logger.debug(f"[CONN {st.conn_id}] FOUND CHILD params candidate: spi={res[0]} enc_key={'yes' if res[1] else 'no'} auth_key={'yes' if res[2] else 'no'} enc_alg={res[3]} src={res[4]} dst={res[5]}")
                             break
         except Exception as e:
             self.logger.exception("Failed to probe state for CHILD_SA params: %s", e)
@@ -279,16 +294,32 @@ class Router:
 
             self.logger.info(f"[CONN {st.conn_id}] SUCCESS: proxied INIT/AUTH; далее прямой ESP (вне overlay)")
 
-            # --- попытка установить CHILD_SA в kernel (если параметры доступны) ---
-            try:
-                ok_install = self._try_install_child_sa_from_state(st)
-                if ok_install:
-                    self.logger.info(f"[CONN {st.conn_id}] CHILD_SA installed into kernel (attempted)")
-                else:
-                    self.logger.info(f"[CONN {st.conn_id}] CHILD_SA not installed (no params available)")
-            except Exception as e:
-                self.logger.exception("Install attempt failed: %s", e)
-            # --- конец попытки ---
+            # --- Подстраховка: дать время CHILD_SA params появиться в состоянии ---
+            wait_seconds = 5.0   # можно увеличить при необходимости
+            deadline = time.time() + wait_seconds
+            installed = False
+
+            # Пытаемся пока не истечёт deadline
+            while time.time() < deadline:
+                try:
+                    if self._try_install_child_sa_from_state(st):
+                        self.logger.info(f"[CONN {st.conn_id}] CHILD_SA installed into kernel (attempted)")
+                        installed = True
+                        break
+                except Exception as e:
+                    self.logger.exception(f"[CONN {st.conn_id}] install attempt exception: {e}")
+                time.sleep(0.1)
+
+            if not installed:
+                # одна последняя попытка для логирования (функция уже логирует отсутствие params)
+                try:
+                    ok_install = self._try_install_child_sa_from_state(st)
+                    if ok_install:
+                        self.logger.info(f"[CONN {st.conn_id}] CHILD_SA installed into kernel (final attempt)")
+                    else:
+                        self.logger.info(f"[CONN {st.conn_id}] CHILD_SA not installed after {wait_seconds}s (no params available)")
+                except Exception as e:
+                    self.logger.exception(f"[CONN {st.conn_id}] final install attempt exception: {e}")
 
             return
 

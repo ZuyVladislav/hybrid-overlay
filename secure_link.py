@@ -1,6 +1,9 @@
 # secure_link.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 from typing import Optional
+
+import hashlib
 
 from crypto_util import aesgcm_encrypt, aesgcm_decrypt
 from protocol import jdump
@@ -27,9 +30,12 @@ class SecureLink:
         aad = f"{mtype}:{self.name}->{peer}:{sess.sid}".encode()
         nonce, ct = aesgcm_encrypt(sess.key, payload, aad=aad)
 
-        # --- added logging for debugging MTU/length issues ---
+        # --- debug: lengths and hash to detect truncation/alteration ---
         try:
-            self.logger.debug(f"[SEC] link_send to={peer} sid={sess.sid} nonce_len={len(nonce)} ct_len={len(ct)} meta={meta}")
+            self.logger.debug(
+                f"[SEC] link_send to={peer} sid={sess.sid} nonce_len={len(nonce)} ct_len={len(ct)} "
+                f"meta={meta} sha256={hashlib.sha256(payload).hexdigest()}"
+            )
         except Exception:
             pass
 
@@ -48,18 +54,29 @@ class SecureLink:
         if not sess:
             raise RuntimeError(f"No session from {peer}")
 
-        # debug
+        # debug: log lengths from the received JSON
         try:
             nhex = msg.get("nonce", "")
             chex = msg.get("ct", "")
-            self.logger.debug(f"[SEC] link_decrypt from={peer} sid={sess.sid} nonce_len={len(nhex)//2} ct_len={len(chex)//2}")
+            self.logger.debug(
+                f"[SEC] link_decrypt from={peer} sid={sess.sid} nonce_len={len(nhex)//2} ct_len={len(chex)//2}"
+            )
         except Exception:
             pass
 
         aad = f"{msg['t']}:{peer}->{self.name}:{sess.sid}".encode()
-        return aesgcm_decrypt(
+        plain = aesgcm_decrypt(
             sess.key,
             bytes.fromhex(msg["nonce"]),
             bytes.fromhex(msg["ct"]),
             aad=aad
         )
+
+        try:
+            self.logger.debug(
+                f"[SEC] link_decrypt OK from={peer} sid={sess.sid} sha256={hashlib.sha256(plain).hexdigest()} len={len(plain)}"
+            )
+        except Exception:
+            pass
+
+        return plain
