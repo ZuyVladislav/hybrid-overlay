@@ -116,11 +116,11 @@ class IkeProxy:
         tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
         tx.setsockopt(socket.SOL_IP, IP_TRANSPARENT, 1)
 
-        # Bind to peer endpoint (spoof source) so charon sees real remote endpoint
+        # IMPORTANT: bind only IP, not port 500
         try:
-            tx.bind((peer_ip, peer_port))
+            tx.bind((peer_ip, 0))  # let kernel choose free port
         except OSError as e:
-            self.logger.error(f"[IKEP] inject bind({peer_ip}:{peer_port}) failed: {e}")
+            self.logger.error(f"[IKEP] inject bind({peer_ip}:0) failed: {e}")
             tx.close()
             return
 
@@ -128,7 +128,7 @@ class IkeProxy:
             tx.sendto(data, (dst_ip, dst_port))
             self.logger.info(
                 f"[IKEP] -> charon inject len={len(data)} "
-                f"src={peer_ip}:{peer_port} dst={dst_ip}:{dst_port}"
+                f"src={peer_ip}:EPHEMERAL dst={dst_ip}:{dst_port}"
             )
         except OSError as e:
             self.logger.error(f"[IKEP] inject sendto({dst_ip}:{dst_port}) failed: {e}")
