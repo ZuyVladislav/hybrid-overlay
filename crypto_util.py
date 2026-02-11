@@ -9,9 +9,16 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
 
 def hkdf_sha256(ikm: bytes, salt: bytes, info: bytes, length: int = 32) -> bytes:
-    return HKDF(algorithm=hashes.SHA256(), length=length, salt=salt, info=info).derive(ikm)
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=length,
+        salt=salt,
+        info=info,
+        backend=default_backend(),
+    ).derive(ikm)
 
 
 def aesgcm_encrypt(key32: bytes, plaintext: bytes, aad: bytes) -> Tuple[bytes, bytes]:
