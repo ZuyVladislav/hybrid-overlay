@@ -1,354 +1,184 @@
 # mgmt.py
 from __future__ import annotations
-
-import secrets
 import threading
-from typing import Optional
+import uuid
+import time
+from typing import Optional, Dict
 
-from cryptography.hazmat.primitives.asymmetric import x25519
-
-from config import UDP_TIMEOUT_S, RETRIES
-from crypto_util import (
-    aesgcm_encrypt,
-    aesgcm_decrypt,
-    hkdf_sha256,
-    xpub_bytes,
-    xpub_from_bytes,
-)
 from protocol import (
-    jdump,
-    err,
-    T_MGMT_INIT,
-    T_MGMT_INIT_RESP,
-    T_MGMT_AUTH,
-    T_MGMT_AUTH_RESP,
+    jdump, jload,
+    T_MGMT_INIT, T_MGMT_INIT_RESP, T_MGMT_AUTH, T_MGMT_AUTH_RESP,
+    T_ERROR
 )
-from state import DaemonState, PendingHS, MgmtSession
+from config import USERS, UDP_TIMEOUT_S, RETRIES
+from state import DaemonState
 
 
 class Mgmt:
-    """
-    MGMT-plane handshake (IKEv2-like):
-      INIT  (I->R): ni, KEi, sid
-      INIT_RESP(R->I): nr, KEr, sid
-      AUTH  (I->R): AESGCM(kd, aad=AUTH:label:I->R:sid)
-      AUTH_RESP(R->I): AESGCM(kd, aad=AUTH:label:R->I:sid)
-
-    Mailbox pattern:
-      - receiver thread calls on_init_resp/on_auth_resp
-      - ensure_session waits on per-sid events
-    """
-
     def __init__(self, name: str, state: DaemonState, transport, logger):
         self.name = name
         self.state = state
         self.transport = transport
         self.logger = logger
 
-    # ---------- KDF ----------
-    @staticmethod
-    def mgmt_kdf(shared: bytes, ni: bytes, nr: bytes, label: str) -> bytes:
-        salt = ni + nr
-        info = b"mgmt|ikev2-like|" + label.encode("utf-8")
-        return hkdf_sha256(shared, salt=salt, info=info, length=32)
-
-    # =========================
-    # MGMT responder
-    # =========================
-    def on_mgmt_init(self, p: dict, peer: Optional[str]):
-        if not peer:
-            return
-
-        sid = p.get("sid")
-        if not sid:
-            return
-
-        i_pub = bytes.fromhex(p["ke"])
-        ni = bytes.fromhex(p["ni"])
-
-        r_priv = x25519.X25519PrivateKey.generate()
-        r_pub = xpub_bytes(r_priv.public_key())
-        nr = secrets.token_bytes(16)
-
-        label = f"{peer}-{self.name}"  # initiator-responder label (responder side)
+    # Внешний вызов: обеспечить mgmt-сессию к peer (ленивая установка)
+    def ensure_session(self, peer: str, reason: str = "PROXY", phase: Optional[str] = None, conn: Optional[str] = None) -> bool:
+        """
+        Попытаться установить mgmt-сессию к peer. Возвращает True если сессия установлена.
+        Блокирующий вызов — он делает несколько попыток и ждёт ответа INIT_RESP.
+        """
+        if peer == self.name:
+            return True
 
         with self.state.lock:
-            self.state.pending[sid] = PendingHS(
-                priv=r_priv, nr=nr, ni=ni, i_pub=i_pub, label=label
-            )
+            st = self.state.sessions.get(peer)
+            if st and st.get("established"):
+                return True
+            # если уже есть inflight - дождёмся
+            inflight = self.state.ensure_inflight.get(peer)
+            if inflight:
+                self.logger.debug(f"[MGMT] ensure_session: waiting existing inflight for {peer}")
+                # ждём до timeout
+                ok = inflight.wait(UDP_TIMEOUT_S * RETRIES + 0.5)
+                with self.state.lock:
+                    st2 = self.state.sessions.get(peer)
+                    return bool(st2 and st2.get("established"))
 
-        resp = jdump(
-            {
-                "t": T_MGMT_INIT_RESP,
+            # пометим inflight
+            ev = threading.Event()
+            self.state.ensure_inflight[peer] = ev
+
+        sid = uuid.uuid4().hex[:16]
+        attempt = 0
+        success = False
+
+        while attempt < RETRIES:
+            attempt += 1
+            self.logger.info(f"[MGMT] -> {peer} INIT sid={sid} attempt={attempt}")
+            payload = {
+                "t": T_MGMT_INIT,
                 "sid": sid,
                 "from": self.name,
                 "to": peer,
-                "nr": nr.hex(),
-                "ke": r_pub.hex(),
+                "meta": {"reason": reason, "phase": phase, "conn": conn}
             }
-        )
-        self.transport.send_peer(peer, resp)
-        self.logger.info(f"[MGMT] <- {peer} INIT; -> INIT_RESP sid={sid}")
+            try:
+                self.transport.send_peer(peer, jdump(payload))
+            except Exception as e:
+                self.logger.warning(f"[MGMT] send INIT to {peer} failed: {e}")
 
-    def on_mgmt_auth(self, p: dict, peer: Optional[str]):
-        if not peer:
-            return
+            # подготовим ожидание
+            ev_local = threading.Event()
+            with self.state.lock:
+                # hs_init_ev — словарь sid->Event (как в оригинальной реализации)
+                self.state.hs_init_ev[sid] = ev_local
 
+            waited = ev_local.wait(UDP_TIMEOUT_S)
+            with self.state.lock:
+                resp = self.state.hs_initresp.pop(sid, None)
+                # убираем event
+                self.state.hs_init_ev.pop(sid, None)
+
+            if waited and resp:
+                # Установим сессию
+                addr_ip = resp.get("addr_ip") or USERS.get(peer, {}).get("ip")
+                addr_port = int(resp.get("addr_port") or USERS.get(peer, {}).get("port"))
+                if addr_ip is None or addr_port is None:
+                    self.logger.warning(f"[MGMT] INIT_RESP from {peer} missed addr info, using config")
+                    addr_ip = USERS.get(peer, {}).get("ip")
+                    addr_port = USERS.get(peer, {}).get("port")
+
+                with self.state.lock:
+                    self.state.sessions[peer] = {"addr": (addr_ip, addr_port), "established": True}
+                    # чистим inflight
+                    self.state.ensure_inflight.pop(peer, None)
+
+                self.logger.info(f"[MGMT] EST {self.name}<->{peer} sid={sid}")
+                success = True
+                break
+
+            # если не дождались — повторим
+            self.logger.warning(f"[MGMT] timeout INIT_RESP from {peer} sid={sid} attempt={attempt} (reason={reason})")
+
+        # если не удалось — пометим неуспех и очистим inflight
+        if not success:
+            with self.state.lock:
+                self.state.ensure_inflight.pop(peer, None)
+            self.logger.error(f"[MGMT] cannot ensure session {peer} after {RETRIES} attempts")
+
+        return success
+
+    # Входящий INIT (responder)
+    def on_mgmt_init(self, p: Dict, peer: Optional[str]):
+        """
+        Обрабатывает входящий MGMT INIT — отвечает INIT_RESP и отмечает сессию.
+        p: словарь с полями 'sid', 'from' и т.д.
+        peer: resolved peer name (transport.resolve_peer)
+        """
         sid = p.get("sid")
-        if not sid:
-            return
-
-        with self.state.lock:
-            st = self.state.pending.get(sid)
-
-        if not st:
-            self.logger.warning(f"[MGMT] AUTH unknown sid={sid} from={peer}")
-            return
-
-        shared = st.priv.exchange(xpub_from_bytes(st.i_pub))
-        kd = self.mgmt_kdf(shared, st.ni, st.nr, label=st.label)
-
-        aad_in = f"AUTH:{st.label}:{peer}->{self.name}:{sid}".encode()
+        frm = p.get("from") or peer
+        self.logger.info(f"[MGMT] <- {frm} INIT; -> INIT_RESP sid={sid}")
+        # Ответим INIT_RESP с нашей адресной информацией
+        my_ip = USERS[self.name]["ip"]
+        my_port = USERS[self.name]["port"]
+        resp = {
+            "t": T_MGMT_INIT_RESP,
+            "sid": sid,
+            "from": self.name,
+            "to": frm,
+            "addr_ip": my_ip,
+            "addr_port": my_port,
+        }
         try:
-            _ = aesgcm_decrypt(
-                kd,
-                bytes.fromhex(p["nonce"]),
-                bytes.fromhex(p["ct"]),
-                aad=aad_in,
-            )
+            self.transport.send_peer(frm, jdump(resp))
         except Exception as e:
-            self.logger.error(f"[MGMT] AUTH decrypt fail sid={sid} from={peer}: {e}")
-            self.transport.send_peer(peer, err("AUTH_FAIL", "mgmt auth decrypt failed"))
-            return
+            self.logger.error(f"[MGMT] failed send INIT_RESP to {frm}: {e}")
 
-        aad_out = f"AUTH:{st.label}:{self.name}->{peer}:{sid}".encode()
-        auth_plain = b"ID=" + self.name.encode() + b"|AUTH=" + secrets.token_bytes(16)
-        n2, c2 = aesgcm_encrypt(kd, auth_plain, aad=aad_out)
-
-        resp = jdump(
-            {
-                "t": T_MGMT_AUTH_RESP,
-                "sid": sid,
-                "from": self.name,
-                "to": peer,
-                "nonce": n2.hex(),
-                "ct": c2.hex(),
-            }
-        )
-        self.transport.send_peer(peer, resp)
-
+        # Пометим сессию как установленную (responder-side)
         with self.state.lock:
-            self.state.sessions[peer] = MgmtSession(peer=peer, sid=sid, key=kd)
-            self.state.pending.pop(sid, None)
+            self.state.sessions[frm] = {"addr": (USERS[frm]["ip"], USERS[frm]["port"]), "established": True}
+        self.logger.info(f"[MGMT] EST {self.name}<->{frm} sid={sid}")
 
-        self.logger.info(f"[MGMT] EST {self.name}<->{peer} sid={sid}")
-
-    # =========================
-    # MGMT mailbox (receiver thread)
-    # =========================
-    def on_init_resp(self, p: dict):
-        if p.get("to") != self.name:
-            return
+    # Входящий INIT_RESP (инициатор ждёт этот ответ)
+    def on_init_resp(self, p: Dict):
         sid = p.get("sid")
-        if not sid:
-            return
-
+        frm = p.get("from")
+        self.logger.info(f"[MGMT] RX {T_MGMT_INIT_RESP} sid={sid} from={frm}")
         with self.state.lock:
             self.state.hs_initresp[sid] = p
             ev = self.state.hs_init_ev.get(sid)
-
-        ev_exists = ev is not None
-        ev_set = 1 if ev_exists else 0
-        self.logger.info(
-            f"[MGMT] RX MGMT_INIT_RESP sid={sid} from={p.get('from')} to={p.get('to')} "
-            f"ev_exists={ev_exists} ev_set={ev_set}"
-        )
         if ev:
-            ev.set()
+            try:
+                ev.set()
+            except Exception:
+                pass
 
-    def on_auth_resp(self, p: dict):
-        if p.get("to") != self.name:
-            return
+    # AUTH обработчики (на будущее) — пока реализованы как пассивные обработчики
+    def on_mgmt_auth(self, p: Dict, peer: Optional[str]):
         sid = p.get("sid")
-        if not sid:
-            return
+        frm = p.get("from") or peer
+        self.logger.info(f"[MGMT] <- {frm} AUTH sid={sid}; -> AUTH_RESP sid={sid}")
+        # простой эхо-ответ (если нужен более строгий обмен — сюда добавить логику)
+        resp = {"t": T_MGMT_AUTH_RESP, "sid": sid, "from": self.name, "to": frm}
+        try:
+            self.transport.send_peer(frm, jdump(resp))
+        except Exception as e:
+            self.logger.error(f"[MGMT] failed send AUTH_RESP to {frm}: {e}")
 
+        # отметим сессию
+        with self.state.lock:
+            self.state.sessions[frm] = {"addr": (USERS[frm]["ip"], USERS[frm]["port"]), "established": True}
+        self.logger.info(f"[MGMT] EST {self.name}<->{frm} sid={sid}")
+
+    def on_auth_resp(self, p: Dict):
+        sid = p.get("sid")
+        frm = p.get("from")
+        self.logger.info(f"[MGMT] RX {T_MGMT_AUTH_RESP} sid={sid} from={frm}")
         with self.state.lock:
             self.state.hs_authresp[sid] = p
             ev = self.state.hs_auth_ev.get(sid)
-
-        ev_exists = ev is not None
-        ev_set = 1 if ev_exists else 0
-        self.logger.info(
-            f"[MGMT] RX MGMT_AUTH_RESP sid={sid} from={p.get('from')} to={p.get('to')} "
-            f"ev_exists={ev_exists} ev_set={ev_set}"
-        )
         if ev:
-            ev.set()
-
-    # =========================
-    # MGMT initiator (ensure_session)
-    # =========================
-    def ensure_session(self, peer: str, reason: str = "") -> bool:
-        if peer == self.name:
-            self.logger.error(f"[MGMT] ensure_session to self forbidden reason={reason}")
-            return False
-
-        # inflight gate per peer (prevents parallel handshakes from same node)
-        with self.state.lock:
-            if peer in self.state.sessions:
-                return True
-
-            inflight_ev = self.state.ensure_inflight.get(peer)
-            if inflight_ev is None:
-                inflight_ev = threading.Event()
-                self.state.ensure_inflight[peer] = inflight_ev
-                i_am_owner = True
-            else:
-                i_am_owner = False
-
-        if not i_am_owner:
-            # someone else is already doing ensure_session(peer)
-            inflight_ev.wait(UDP_TIMEOUT_S * RETRIES)
-            with self.state.lock:
-                return peer in self.state.sessions
-
-        try:
-            label = f"{self.name}-{peer}"  # initiator-responder label (initiator side)
-
-            self.logger.info(
-                f"[MGMT] ensure_session start {self.name}->{peer} "
-                f"reason={reason or 'unspecified'}"
-            )
-
-            for attempt in range(1, RETRIES + 1):
-                sid = secrets.token_hex(8)
-                init_ev = threading.Event()
-                auth_ev = threading.Event()
-
-                with self.state.lock:
-                    self.state.hs_init_ev[sid] = init_ev
-                    self.state.hs_auth_ev[sid] = auth_ev
-                    self.state.hs_initresp.pop(sid, None)
-                    self.state.hs_authresp.pop(sid, None)
-
-                # --- build INIT ---
-                i_priv = x25519.X25519PrivateKey.generate()
-                i_pub = xpub_bytes(i_priv.public_key())
-                ni = secrets.token_bytes(16)
-
-                init_msg = jdump(
-                    {
-                        "t": T_MGMT_INIT,
-                        "sid": sid,
-                        "from": self.name,
-                        "to": peer,
-                        "ni": ni.hex(),
-                        "ke": i_pub.hex(),
-                    }
-                )
-                self.transport.send_peer(peer, init_msg)
-                self.logger.info(f"[MGMT] -> {peer} INIT sid={sid} attempt={attempt}")
-
-                # --- wait INIT_RESP ---
-                self.logger.info(f"[MGMT] WAIT INIT_RESP sid={sid} peer={peer} attempt={attempt}")
-                if not init_ev.wait(UDP_TIMEOUT_S):
-                    self.logger.warning(
-                        f"[MGMT] timeout INIT_RESP from {peer} sid={sid} "
-                        f"reason={reason or 'unspecified'}"
-                    )
-                    self._cleanup_hs(sid)
-                    continue
-
-                with self.state.lock:
-                    resp = self.state.hs_initresp.get(sid)
-
-                if not resp or resp.get("from") != peer or resp.get("to") != self.name:
-                    self.logger.warning(
-                        f"[MGMT] bad INIT_RESP mailbox sid={sid} got_from={resp.get('from') if resp else None} "
-                        f"got_to={resp.get('to') if resp else None} reason={reason or 'unspecified'}"
-                    )
-                    self._cleanup_hs(sid)
-                    continue
-
-                nr = bytes.fromhex(resp["nr"])
-                r_pub = bytes.fromhex(resp["ke"])
-                shared = i_priv.exchange(xpub_from_bytes(r_pub))
-                kd = self.mgmt_kdf(shared, ni, nr, label=label)
-
-                # --- send AUTH ---
-                aad_out = f"AUTH:{label}:{self.name}->{peer}:{sid}".encode()
-                auth_plain = b"ID=" + self.name.encode() + b"|AUTH=" + secrets.token_bytes(16)
-                n1, c1 = aesgcm_encrypt(kd, auth_plain, aad=aad_out)
-
-                auth_msg = jdump(
-                    {
-                        "t": T_MGMT_AUTH,
-                        "sid": sid,
-                        "from": self.name,
-                        "to": peer,
-                        "nonce": n1.hex(),
-                        "ct": c1.hex(),
-                    }
-                )
-                self.transport.send_peer(peer, auth_msg)
-
-                # --- wait AUTH_RESP ---
-                self.logger.info(f"[MGMT] WAIT AUTH_RESP sid={sid} peer={peer} attempt={attempt}")
-                if not auth_ev.wait(UDP_TIMEOUT_S):
-                    self.logger.warning(
-                        f"[MGMT] timeout AUTH_RESP from {peer} sid={sid} "
-                        f"reason={reason or 'unspecified'}"
-                    )
-                    self._cleanup_hs(sid)
-                    continue
-
-                with self.state.lock:
-                    resp2 = self.state.hs_authresp.get(sid)
-
-                if not resp2 or resp2.get("from") != peer or resp2.get("to") != self.name:
-                    self.logger.warning(
-                        f"[MGMT] bad AUTH_RESP mailbox sid={sid} got_from={resp2.get('from') if resp2 else None} "
-                        f"got_to={resp2.get('to') if resp2 else None} reason={reason or 'unspecified'}"
-                    )
-                    self._cleanup_hs(sid)
-                    continue
-
-                # --- verify AUTH_RESP ---
-                aad_in = f"AUTH:{label}:{peer}->{self.name}:{sid}".encode()
-                try:
-                    _ = aesgcm_decrypt(
-                        kd,
-                        bytes.fromhex(resp2["nonce"]),
-                        bytes.fromhex(resp2["ct"]),
-                        aad=aad_in,
-                    )
-                except Exception as e:
-                    self.logger.error(f"[MGMT] AUTH_RESP decrypt fail sid={sid} from={peer}: {e}")
-                    self._cleanup_hs(sid)
-                    continue
-
-                with self.state.lock:
-                    self.state.sessions[peer] = MgmtSession(peer=peer, sid=sid, key=kd)
-
-                self._cleanup_hs(sid)
-                self.logger.info(
-                    f"[MGMT] EST {self.name}<->{peer} sid={sid} reason={reason or 'unspecified'}"
-                )
-                return True
-
-            return False
-
-        finally:
-            # release inflight gate
-            with self.state.lock:
-                ev = self.state.ensure_inflight.pop(peer, None)
-                if ev:
-                    ev.set()
-
-    def _cleanup_hs(self, sid: str):
-        with self.state.lock:
-            self.state.hs_init_ev.pop(sid, None)
-            self.state.hs_auth_ev.pop(sid, None)
-            self.state.hs_initresp.pop(sid, None)
-            self.state.hs_authresp.pop(sid, None)
+            try:
+                ev.set()
+            except Exception:
+                pass
