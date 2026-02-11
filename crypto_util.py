@@ -37,6 +37,10 @@ def xpub_bytes(pub: x25519.X25519PublicKey) -> bytes:
     )
 
 
+def xpub_from_bytes(b: bytes) -> x25519.X25519PublicKey:
+    return x25519.X25519PublicKey.from_public_bytes(b)
+
+
 @dataclass
 class HandshakeState:
     priv: x25519.X25519PrivateKey
