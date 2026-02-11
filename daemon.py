@@ -107,6 +107,10 @@ class NodeDaemon:
 
     def _on_ike_local(self, data: bytes, dport: int, src, orig_dst):
         if not self.ike_route:
+            self.logger.warning(
+                f"[IKEP] ike_route EMPTY on {self.name} "
+                f"-> NOT sending to overlay (src={src}, dport={dport})"
+            )
             return
 
         meta = dict(self.ike_route)
