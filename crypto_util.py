@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import serialization
-
+from cryptography.hazmat.backends import default_backend
 
 def hkdf_sha256(ikm: bytes, salt: bytes, info: bytes, length: int = 32) -> bytes:
     return HKDF(
@@ -18,6 +18,7 @@ def hkdf_sha256(ikm: bytes, salt: bytes, info: bytes, length: int = 32) -> bytes
         length=length,
         salt=salt,
         info=info,
+        backend=default_backend(),
     ).derive(ikm)
 
 
