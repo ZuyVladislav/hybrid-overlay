@@ -106,17 +106,21 @@ class IkeProxy:
         # Best: use original local IP (e.g., 192.168.3.101) so charon sees correct dst.
         # Fallback: 127.0.0.1 (works sometimes, but can break strict endpoint expectations).
         if local_dst is None:
-            dst_ip = local_dst[0]
+            dst_ip = "127.0.0.1"
             dst_port = real_port
         else:
-            dst_ip, dst_port = local_dst[0], real_port  # force port=500 even if orig_dst shows 500 already
+            dst_ip = local_dst[0]
+            dst_port = real_port
 
         peer_ip, peer_port = peer_addr
 
         tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
+        tx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            tx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError:
+            pass
         tx.setsockopt(socket.SOL_IP, IP_TRANSPARENT, 1)
-
-        # IMPORTANT: bind only IP, not port 500
         try:
             tx.bind((peer_ip, 0))  # let kernel choose free port
         except OSError as e:
