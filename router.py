@@ -1,12 +1,16 @@
 # router.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+
 import random
 import secrets
 import threading
 import time
 import subprocess
-from typing import Dict, List, Tuple
+import binascii
+import shlex
+import json
+from typing import Dict, List, Tuple, Any, Optional
 
 from config import USERS, UDP_TIMEOUT_S, I3_LEN
 from protocol import jdump, err, T_LOCAL_CONNECT, T_I1, T_I2, T_OKX2, T_PROXY_BLOB
@@ -37,110 +41,273 @@ class Router:
                 out[k.strip()] = v.strip()
         return out
 
-    # --- helper: try install CHILD_SA into kernel ---
-    def _try_install_child_sa_from_state(self, st: ConnState) -> bool:
+    # ---------------------------------------------------------------------
+    # Robust CHILD_SA extraction + install
+    # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _try_get(keys: List[str], src: dict):
+        for k in keys:
+            if k in src and src[k] is not None:
+                return src[k]
+        return None
+
+    @staticmethod
+    def _maybe_hex(v):
         """
-        Попытаться найти параметры CHILD_SA в st/self.state и установить xfrm через /usr/local/bin/install_sa.sh.
-        Возвращает True если вызов был произведён и завершился успешно, иначе False.
+        Приводит int/bytes/hexstr/decimalstr -> hexstr (без 0x), либо None.
         """
-
-        # DEBUG: dump probe context
+        if v is None:
+            return None
+        if isinstance(v, bytes):
+            return binascii.hexlify(v).decode().lower()
+        if isinstance(v, int):
+            return format(v, "x").lower()
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s.startswith("0x"):
+                s = s[2:]
+            # hex?
+            try:
+                int(s, 16)
+                return s
+            except Exception:
+                # decimal?
+                try:
+                    return format(int(s), "x").lower()
+                except Exception:
+                    return None
+        # fallback: stringify
         try:
-            self.logger.debug(f"[CONN {st.conn_id}] probe state attrs: st_keys={list(st.__dict__.keys())}")
+            s = str(v).strip().lower()
+            if s.startswith("0x"):
+                s = s[2:]
+            int(s, 16)
+            return s
         except Exception:
-            pass
-        try:
-            self.logger.debug(f"[CONN {st.conn_id}] state child_sas={getattr(self.state, 'child_sas', None)}")
-        except Exception:
-            pass
-
-        candidates = [
-            getattr(st, 'child_spi_out', None),
-            getattr(st, 'spi_out', None),
-            getattr(st, 'child', None),
-            getattr(self.state, 'child_sas', None),
-        ]
-
-        def extract_from(obj):
-            if obj is None:
-                return None
-            if isinstance(obj, dict):
-                spi = obj.get('spi_out') or obj.get('spi') or obj.get('spi_out_hex')
-                sk_e = obj.get('sk_e') or obj.get('sk_enc') or obj.get('enc_key')
-                sk_a = obj.get('sk_a') or obj.get('sk_auth') or obj.get('auth_key')
-                enc = obj.get('enc') or obj.get('enc_alg') or obj.get('encryption')
-                src = obj.get('src') or obj.get('src_ip') or None
-                dst = obj.get('dst') or obj.get('dst_ip') or None
-                return spi, sk_e, sk_a, enc, src, dst
             return None
 
-        # Try direct attributes on st
+    @staticmethod
+    def _state_to_dict(st) -> dict:
+        if st is None:
+            return {}
         try:
-            spi = getattr(st, 'spi_out', None) or getattr(st, 'child_spi_out', None)
-            sk_e = getattr(st, 'sk_e', None) or getattr(st, 'child_sk_e', None)
-            sk_a = getattr(st, 'sk_a', None) or getattr(st, 'child_sk_a', None)
-            enc = getattr(st, 'enc_alg', None) or getattr(st, 'child_enc', None)
-            src_ip = getattr(st, 'src_ip', None) or getattr(st, 'src', None)
-            dst_ip = getattr(st, 'dst_ip', None) or getattr(st, 'dst', None)
+            return dict(getattr(st, "__dict__", {}) or {})
+        except Exception:
+            return {}
 
-            found = None
-            if spi and sk_e and sk_a:
-                found = (spi, sk_e, sk_a, enc, src_ip, dst_ip)
-                self.logger.debug(f"[CONN {st.conn_id}] FOUND CHILD params direct: spi={spi} enc_key={'yes' if sk_e else 'no'} auth_key={'yes' if sk_a else 'no'} enc_alg={enc} src={src_ip} dst={dst_ip}")
-            else:
-                for c in candidates:
-                    if isinstance(c, dict):
-                        res = extract_from(c)
-                        if res and res[0] and res[1] and res[2]:
-                            found = res
-                            self.logger.debug(f"[CONN {st.conn_id}] FOUND CHILD params candidate: spi={res[0]} enc_key={'yes' if res[1] else 'no'} auth_key={'yes' if res[2] else 'no'} enc_alg={res[3]} src={res[4]} dst={res[5]}")
-                            break
-        except Exception as e:
-            self.logger.exception("Failed to probe state for CHILD_SA params: %s", e)
-            found = None
+    @staticmethod
+    def _merge_sources(base: dict, extra: Optional[dict]) -> dict:
+        if not extra or not isinstance(extra, dict):
+            return base
+        for k, v in extra.items():
+            if v is not None and k not in base:
+                base[k] = v
+        return base
 
-        if not found:
-            self.logger.warning(f"[CONN {st.conn_id}] CHILD_SA params not found (cannot install kernel SA)")
+    @staticmethod
+    def _maybe_parse_payload(maybe_payload) -> Optional[dict]:
+        """
+        Пытается привести payload к dict:
+        - dict -> dict
+        - bytes/str -> пробуем json.loads (мягко)
+        Иначе None.
+        """
+        if maybe_payload is None:
+            return None
+        if isinstance(maybe_payload, dict):
+            return maybe_payload
+        if isinstance(maybe_payload, (bytes, bytearray)):
+            try:
+                s = maybe_payload.decode(errors="ignore").strip()
+                if not s:
+                    return None
+                obj = json.loads(s)
+                return obj if isinstance(obj, dict) else None
+            except Exception:
+                return None
+        if isinstance(maybe_payload, str):
+            try:
+                s = maybe_payload.strip()
+                if not s:
+                    return None
+                obj = json.loads(s)
+                return obj if isinstance(obj, dict) else None
+            except Exception:
+                return None
+        return None
+
+    def find_and_install_child_sa(self, st: ConnState, maybe_payload=None, meta=None) -> bool:
+        """
+        Пытается найти spi/sk_e/sk_a/enc_alg/src_ip/dst_ip в st и maybe_payload/meta,
+        поддерживает разные имена полей, нормализует в hex, и вызывает install_sa.sh.
+        Возвращает True/False (успех установки SA).
+        """
+        conn_id = getattr(st, "conn_id", None) or (meta.get("conn_id") if isinstance(meta, dict) else None) or "NONE"
+
+        # 0) Собираем максимально широкий "словарь источников"
+        src: Dict[str, Any] = {}
+
+        # st -> dict
+        src.update(self._state_to_dict(st))
+
+        # meta может давать адреса/alg/route
+        if isinstance(meta, dict):
+            for k, v in meta.items():
+                if v is not None:
+                    src[k] = v
+
+        # maybe_payload (dict / bytes/str as json)
+        payload_obj = self._maybe_parse_payload(maybe_payload)
+        if isinstance(payload_obj, dict):
+            for k, v in payload_obj.items():
+                if v is not None and k not in src:
+                    src[k] = v
+
+        # fallback: self.state.child_sas (если существует) — ЧИТАЕМ ПОД LOCK
+        try:
+            with self.state.lock:
+                child_sas = getattr(self.state, "child_sas", None)
+
+            if isinstance(child_sas, dict):
+                if conn_id in child_sas and isinstance(child_sas[conn_id], dict):
+                    self._merge_sources(src, child_sas[conn_id])
+                else:
+                    if "spi" in child_sas or "spi_out" in child_sas:
+                        self._merge_sources(src, child_sas)
+        except Exception:
+            pass
+
+        # DEBUG: покажем, что вообще есть
+        try:
+            self.logger.debug(f"[CONN {conn_id}] find_child: probe keys={sorted(list(src.keys()))}")
+        except Exception:
+            pass
+
+        # 1) Ищем spi
+        spi = self._try_get(
+            ["spi_out", "child_spi_out", "spi", "child_spi", "spi_out_hex", "child_spi_out_hex"],
+            src
+        )
+
+        # 2) Ищем ключи шифрования/аутентификации
+        sk_e = self._try_get(
+            ["sk_e", "child_sk_e", "sk_enc", "child_sk_enc", "enc_key", "enc_key_hex"],
+            src
+        )
+        sk_a = self._try_get(
+            ["sk_a", "child_sk_a", "sk_auth", "child_sk_auth", "auth_key", "auth_key_hex"],
+            src
+        )
+
+        # 3) Алгоритм шифрования
+        enc_alg = self._try_get(
+            ["enc", "enc_alg", "esp_alg", "enc_algo", "encryption", "cipher"],
+            src
+        )
+
+        # 4) IP адреса
+        src_ip = self._try_get(["src_ip", "src", "src_addr", "src_ip_addr", "local_ip"], src) or None
+        dst_ip = self._try_get(["dst_ip", "dst", "dst_addr", "dst_ip_addr", "remote_ip"], src) or None
+
+        # 5) Нормализуем spi -> hexstr
+        spi_hex = None
+        if spi is not None:
+            if isinstance(spi, int):
+                spi_hex = format(spi, "x").lower()
+            elif isinstance(spi, bytes):
+                spi_hex = binascii.hexlify(spi).decode().lower()
+            elif isinstance(spi, str):
+                s = spi.strip().lower()
+                if s.startswith("0x"):
+                    s = s[2:]
+                try:
+                    int(s, 16)
+                    spi_hex = s
+                except Exception:
+                    try:
+                        spi_hex = format(int(s), "x").lower()
+                    except Exception:
+                        spi_hex = None
+
+        # SPI: гарантируем чётную длину (паддинг ведущим 0, если нужно)
+        if spi_hex and (len(spi_hex) % 2) != 0:
+            spi_hex = "0" + spi_hex
+
+        enc_key_hex = self._maybe_hex(sk_e)
+        auth_key_hex = self._maybe_hex(sk_a)
+
+        self.logger.debug(
+            f"[CONN {conn_id}] find_child: "
+            f"spi={'yes' if spi_hex else 'no'} "
+            f"enc_key={'yes' if enc_key_hex else 'no'} "
+            f"auth_key={'yes' if auth_key_hex else 'no'} "
+            f"enc_alg={enc_alg} src={src_ip} dst={dst_ip}"
+        )
+
+        if not (spi_hex and enc_key_hex and auth_key_hex):
+            self.logger.warning(f"[CONN {conn_id}] CHILD_SA params not found (cannot install kernel SA)")
             return False
 
-        spi, sk_e, sk_a, enc, src_ip, dst_ip = found
+        # 6) Если IP отсутствуют — пробуем из st явно
+        if not src_ip:
+            src_ip = getattr(st, "src", None) or getattr(st, "local_ip", None)
+        if not dst_ip:
+            dst_ip = getattr(st, "dst", None) or getattr(st, "remote_ip", None)
 
-        # normalize spi hex (remove 0x if present)
-        if isinstance(spi, str) and spi.startswith('0x'):
-            spi_hex = spi[2:]
-        else:
-            spi_hex = spi if isinstance(spi, str) else None
+        # 7) last fallback: route / src/dst usernames в meta
+        if (not src_ip or not dst_ip) and isinstance(meta, dict):
+            r = meta.get("route")
+            if isinstance(r, (list, tuple)) and len(r) >= 2:
+                try:
+                    if not src_ip:
+                        src_ip = USERS[r[0]]["ip"]
+                    if not dst_ip:
+                        dst_ip = USERS[r[-1]]["ip"]
+                except Exception:
+                    pass
 
-        def tohex(v):
-            if v is None:
-                return None
-            if isinstance(v, bytes):
-                return v.hex()
-            s = str(v)
-            return s[2:] if s.startswith('0x') else s
+            if (not src_ip or not dst_ip):
+                try:
+                    if not src_ip and meta.get("src") in USERS:
+                        src_ip = USERS[meta["src"]]["ip"]
+                    if not dst_ip and meta.get("dst") in USERS:
+                        dst_ip = USERS[meta["dst"]]["ip"]
+                except Exception:
+                    pass
 
-        enc_key_hex = tohex(sk_e)
-        auth_key_hex = tohex(sk_a)
-        enc_alg = enc or 'aes256'
-
-        if not (spi_hex and enc_key_hex and auth_key_hex and src_ip and dst_ip):
+        if not src_ip or not dst_ip:
             self.logger.warning(
-                f"[CONN {st.conn_id}] incomplete CHILD params: spi={spi_hex}, "
-                f"enc={enc_key_hex is not None}, auth={auth_key_hex is not None}, src={src_ip}, dst={dst_ip}"
+                f"[CONN {conn_id}] cannot determine src/dst ip for install_sa, src_ip={src_ip} dst_ip={dst_ip}"
             )
             return False
 
-        cmd = ["/usr/local/bin/install_sa.sh", src_ip, dst_ip, spi_hex, enc_key_hex, auth_key_hex, enc_alg]
-        self.logger.info(f"[CONN {st.conn_id}] calling install_sa")
+        # 8) Вызов install_sa.sh
         try:
-            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=20, text=True)
-            self.logger.info(f"[CONN {st.conn_id}] install_sa: {out.strip()}")
+            spi_hex = spi_hex.lower()
+            enc_key_hex = enc_key_hex.lower()
+            auth_key_hex = auth_key_hex.lower()
+            enc_alg = enc_alg or "aes128"  # подстрой под install_sa.sh/ядро при необходимости
+
+            cmd = ["/usr/local/bin/install_sa.sh", str(src_ip), str(dst_ip), spi_hex, enc_key_hex, auth_key_hex, str(enc_alg)]
+            self.logger.info(f"[CONN {conn_id}] calling install_sa: {' '.join(shlex.quote(x) for x in cmd)}")
+
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=5)
+            out_text = out.decode(errors="ignore")
+            self.logger.info(f"[CONN {conn_id}] install_sa: {out_text.strip()}")
             return True
+
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"[CONN {st.conn_id}] install_sa failed (rc=%s): %s", e.returncode, e.output)
+            msg = ""
+            try:
+                msg = e.output.decode(errors="ignore") if e.output else str(e)
+            except Exception:
+                msg = str(e)
+            self.logger.error(f"[CONN {conn_id}] install_sa failed (rc={e.returncode}): {msg}")
+            return False
         except Exception as e:
-            self.logger.exception(f"[CONN {st.conn_id}] install_sa exception: {e}")
-        return False
+            self.logger.exception(f"[CONN {conn_id}] install_sa exception: {e}")
+            return False
 
     # -------- LOCAL_CONNECT --------
     def on_local_connect(self, p: dict, src: Tuple[str, int]):
@@ -295,15 +462,14 @@ class Router:
             self.logger.info(f"[CONN {st.conn_id}] SUCCESS: proxied INIT/AUTH; далее прямой ESP (вне overlay)")
 
             # --- Подстраховка: дать время CHILD_SA params появиться в состоянии ---
-            wait_seconds = 5.0   # можно увеличить при необходимости
-            deadline = time.time() + wait_seconds
+            wait_seconds = 5.0
+            deadline_ts = time.time() + wait_seconds
             installed = False
 
-            # Пытаемся пока не истечёт deadline
-            while time.time() < deadline:
+            while time.time() < deadline_ts:
                 try:
-                    if self._try_install_child_sa_from_state(st):
-                        self.logger.info(f"[CONN {st.conn_id}] CHILD_SA installed into kernel (attempted)")
+                    if self.find_and_install_child_sa(st, maybe_payload=None, meta=meta_base):
+                        self.logger.info(f"[CONN {st.conn_id}] CHILD_SA installed into kernel")
                         installed = True
                         break
                 except Exception as e:
@@ -311,9 +477,8 @@ class Router:
                 time.sleep(0.1)
 
             if not installed:
-                # одна последняя попытка для логирования (функция уже логирует отсутствие params)
                 try:
-                    ok_install = self._try_install_child_sa_from_state(st)
+                    ok_install = self.find_and_install_child_sa(st, maybe_payload=None, meta=meta_base)
                     if ok_install:
                         self.logger.info(f"[CONN {st.conn_id}] CHILD_SA installed into kernel (final attempt)")
                     else:
