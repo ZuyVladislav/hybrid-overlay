@@ -101,41 +101,19 @@ class Proxy:
             self.logger.warning(f"[PROXY] route mismatch idx={idx} dir={direction} route={route} meta={meta}")
             return
 
-        # If we are at final hop in forward direction -> special behavior
-        if direction == "fwd" and idx == len(route) - 1:
-            # Arrived at DST
-            self.logger.info(f"[PROXY] ARRIVE DST={self.name} phase={phase} len={len(payload)} CONN={conn_id}")
-            # For IKE_REAL we already handled injection in handle_PROXY; but keep safety here
-            if phase == "IKE_REAL":
-                self.logger.info(f"[PROXY] (safety) IKE_REAL inject to charon on DST={self.name}")
-                # Can't inject if no peer_ip/orig_dst info: just log
-                return
-            # Otherwise, start back-route: send payload back along overlay with dir=back idx=0
-            meta2 = dict(meta)
-            meta2["dir"] = "back"
-            meta2["idx"] = 0
-            back_route = route_back
-            if len(back_route) < 2:
-                self.logger.error(f"[PROXY] back route invalid for DST arrival: {back_route}")
-                return
-            nxt = back_route[1]
-            try:
-                self.sec.link_send(nxt, T_PROXY_BLOB, payload, meta=meta2)
-                self.logger.info(
-                    f"[PROXY] start BACK {self.name}->{nxt} idx=0 phase={phase} "
-                    f"route={src_u}->{x1_u}->{x2_u}->{dst_u} CONN={conn_id}"
-                )
-            except Exception as e:
-                self.logger.exception(f"[PROXY] failed starting back from DST to {nxt}: {e}")
-            return
-
-        # Normal forwarding to next hop
+        # Compute next hop
         nxt_idx = idx + 1
         if nxt_idx >= len(route):
             # nothing to send
             return
         nxt = route[nxt_idx]
 
+        # If next hop resolves to self -> bug/loop — drop safely before ensure_session
+        if nxt == self.name:
+            self.logger.error(f"[PROXY] BUG: next hop is self (nxt_idx={nxt_idx}) — drop to avoid ensure_session(self). meta={meta}")
+            return
+
+        # Ensure we have a session to next hop (create if needed)
         with self.state.lock:
             has_session = nxt in self.state.sessions
 
@@ -156,9 +134,6 @@ class Proxy:
                 return
 
         meta2 = dict(meta); meta2["idx"] = nxt_idx
-        if nxt == self.name:
-            self.logger.error(f"[PROXY] BUG: next hop is self, drop. meta={meta}")
-            return
 
         try:
             self.sec.link_send(nxt, T_PROXY_BLOB, payload, meta=meta2)
